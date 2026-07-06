@@ -57,7 +57,7 @@ def _looks_like_noise(tag):
 
 def extract_content_bs4_fallback(soup):
     soup = BeautifulSoup(str(soup), "lxml")
-    for tag_name in ("header", "footer", "nav", "aside", "script", "style", "noscript", "form"):
+    for tag_name in ("header", "footer", "nav", "aside", "script", "style", "noscript", "form", "template", "iframe"):
         for tag in soup.find_all(tag_name):
             tag.decompose()
     for tag in soup.find_all(True):
@@ -88,7 +88,33 @@ def extract_content(html, url, soup):
                 text = fallback_text
         except Exception:
             pass
-    return (text or "").strip()
+    return _clean_residual_html(text or "").strip()
+
+
+# Detects leftover markup (e.g. hidden <template>/AJAX "load more" blocks some
+# sites embed for infinite-scroll post cards) that slipped through trafilatura
+# or the bs4 fallback and ended up as literal text instead of being stripped.
+_HTML_TAG_PATTERN = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?>")
+
+
+def _clean_residual_html(text):
+    if not text:
+        return text
+    tag_hits = len(_HTML_TAG_PATTERN.findall(text))
+    # A handful of stray "<a>"-style mentions in prose is normal; dozens of
+    # real HTML tags (div/span/class=...) means a raw markup block leaked in.
+    if tag_hits < 5:
+        return text
+    log.warning("extract_content: stripping %d residual HTML tags from extracted text", tag_hits)
+    cleaned_soup = BeautifulSoup(text, "html.parser")
+    for tag_name in ("script", "style", "template", "noscript"):
+        for tag in cleaned_soup.find_all(tag_name):
+            tag.decompose()
+    cleaned = cleaned_soup.get_text(" ", strip=True)
+    # Collapse the class-name/attribute soup that's left once tags are gone
+    # (e.g. "col-sm-3 post-46892 post type-post status-publish...").
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
 
 
 # --- Canonical URL + deduplication -------------------------------------------
