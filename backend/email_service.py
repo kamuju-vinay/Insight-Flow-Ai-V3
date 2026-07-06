@@ -342,6 +342,38 @@ def _send_via_resend(to, subject, html, sender_name, sender_email, api_key):
     return resp.json()
 
 
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+
+
+def _send_via_brevo(to, subject, html, sender_name, sender_email, api_key):
+    """Brevo (formerly Sendinblue) HTTPS transactional email API.
+
+    Chosen as an alternative to Resend for cases where the sender identity is
+    verified as a single email address (no domain/DNS ownership required),
+    unlike Resend which requires a verified domain. Uses the same compiled
+    HTML digest as the Resend/SMTP paths — only the transport differs.
+    """
+    payload = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": to}],
+        "subject": subject,
+        "htmlContent": html,
+    }
+    resp = httpx.post(
+        BREVO_API_URL,
+        headers={
+            "api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Brevo error {resp.status_code}: {resp.text}")
+    return resp.json()
+
+
 def _send_via_smtp(to, subject, html, cfg):
     smtp_host = cfg.get("smtp_host")
     smtp_port = int(cfg.get("smtp_port") or 587)
@@ -382,33 +414,45 @@ def _send_via_smtp(to, subject, html, cfg):
 
 
 def send_email(to, subject, html, articles_count=0, plan_id=None, plan_name=""):
-    """Sends one email. Tries Resend first, falls back to SMTP. Always logs to email_log."""
+    """Sends one email. Tries Brevo first (if configured — no domain needed),
+    then Resend, then falls back to SMTP. Always logs to email_log."""
     cfg = get_settings()
+    brevo_key = cfg.get("brevo_api_key") or os.environ.get("BREVO_API_KEY")
     resend_key = cfg.get("resend_api_key") or os.environ.get("RESEND_API_KEY")
     sender_email = (
-        cfg.get("resend_from_email")
+        cfg.get("brevo_from_email")
+        or os.environ.get("BREVO_FROM_EMAIL")
+        or cfg.get("resend_from_email")
         or os.environ.get("RESEND_FROM_EMAIL")
         or cfg.get("sender_email")
         or "onboarding@resend.dev"
     )
-    sender_name = cfg.get("resend_from_name") or cfg.get("sender_name") or "Insight Flow AI"
+    sender_name = (
+        cfg.get("brevo_from_name")
+        or cfg.get("resend_from_name")
+        or cfg.get("sender_name")
+        or "Insight Flow AI"
+    )
 
     log_id = f"el_{int(datetime.utcnow().timestamp() * 1000)}"
     status, error = "pending", ""
     try:
-        if resend_key:
+        if brevo_key:
+            _send_via_brevo(to, subject, html, sender_name, sender_email, brevo_key)
+        elif resend_key:
             _send_via_resend(to, subject, html, sender_name, sender_email, resend_key)
         else:
             _send_via_smtp(to, subject, html, cfg)
         status = "sent"
     except Exception as e:
-        # If Resend was configured but failed, fall back to SMTP once before giving up.
-        if resend_key:
+        # If Brevo/Resend was configured but failed, fall back to SMTP once before giving up.
+        if brevo_key or resend_key:
             try:
                 _send_via_smtp(to, subject, html, cfg)
                 status = "sent"
             except Exception as e2:
-                status, error = "failed", f"Resend failed ({e}); SMTP fallback failed ({e2})"
+                provider = "Brevo" if brevo_key else "Resend"
+                status, error = "failed", f"{provider} failed ({e}); SMTP fallback failed ({e2})"
         else:
             status, error = "failed", str(e)
 
