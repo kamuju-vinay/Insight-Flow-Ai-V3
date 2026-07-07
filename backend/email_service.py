@@ -29,6 +29,7 @@ from backend.db import get_settings, save_email_log
 log = logging.getLogger(__name__)
 
 RESEND_API_URL = "https://api.resend.com/emails"
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 LOGO_CANDIDATES = [
     os.path.join(os.path.dirname(__file__), "..", "dist", "logo.png"),
@@ -342,30 +343,22 @@ def _send_via_resend(to, subject, html, sender_name, sender_email, api_key):
     return resp.json()
 
 
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-
-
 def _send_via_brevo(to, subject, html, sender_name, sender_email, api_key):
-    """Brevo (formerly Sendinblue) HTTPS transactional email API.
-
-    Chosen as an alternative to Resend for cases where the sender identity is
-    verified as a single email address (no domain/DNS ownership required),
-    unlike Resend which requires a verified domain. Uses the same compiled
-    HTML digest as the Resend/SMTP paths — only the transport differs.
-    """
     payload = {
         "sender": {"name": sender_name, "email": sender_email},
         "to": [{"email": to}],
         "subject": subject,
         "htmlContent": html,
     }
+    logo_path = _find_logo()
+    if logo_path:
+        with open(logo_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        payload["attachment"] = [{"content": b64, "name": "logo.png"}]
+
     resp = httpx.post(
         BREVO_API_URL,
-        headers={
-            "api-key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers={"api-key": api_key, "Content-Type": "application/json", "Accept": "application/json"},
         json=payload,
         timeout=30,
     )
@@ -414,8 +407,7 @@ def _send_via_smtp(to, subject, html, cfg):
 
 
 def send_email(to, subject, html, articles_count=0, plan_id=None, plan_name=""):
-    """Sends one email. Tries Brevo first (if configured — no domain needed),
-    then Resend, then falls back to SMTP. Always logs to email_log."""
+    """Sends one email. Tries Brevo first, then Resend, then SMTP. Always logs to email_log."""
     cfg = get_settings()
     brevo_key = cfg.get("brevo_api_key") or os.environ.get("BREVO_API_KEY")
     resend_key = cfg.get("resend_api_key") or os.environ.get("RESEND_API_KEY")
@@ -436,25 +428,25 @@ def send_email(to, subject, html, articles_count=0, plan_id=None, plan_name=""):
 
     log_id = f"el_{int(datetime.utcnow().timestamp() * 1000)}"
     status, error = "pending", ""
-    try:
-        if brevo_key:
-            _send_via_brevo(to, subject, html, sender_name, sender_email, brevo_key)
-        elif resend_key:
-            _send_via_resend(to, subject, html, sender_name, sender_email, resend_key)
-        else:
-            _send_via_smtp(to, subject, html, cfg)
-        status = "sent"
-    except Exception as e:
-        # If Brevo/Resend was configured but failed, fall back to SMTP once before giving up.
-        if brevo_key or resend_key:
-            try:
-                _send_via_smtp(to, subject, html, cfg)
-                status = "sent"
-            except Exception as e2:
-                provider = "Brevo" if brevo_key else "Resend"
-                status, error = "failed", f"{provider} failed ({e}); SMTP fallback failed ({e2})"
-        else:
-            status, error = "failed", str(e)
+    errors = []
+
+    providers = []
+    if brevo_key:
+        providers.append(("brevo", lambda: _send_via_brevo(to, subject, html, sender_name, sender_email, brevo_key)))
+    if resend_key:
+        providers.append(("resend", lambda: _send_via_resend(to, subject, html, sender_name, sender_email, resend_key)))
+    providers.append(("smtp", lambda: _send_via_smtp(to, subject, html, cfg)))
+
+    for name, send_fn in providers:
+        try:
+            send_fn()
+            status = "sent"
+            break
+        except Exception as e:
+            errors.append(f"{name} failed ({e})")
+            status = "failed"
+
+    error = "; ".join(errors) if status != "sent" else ""
 
     save_email_log({
         "id": log_id,
