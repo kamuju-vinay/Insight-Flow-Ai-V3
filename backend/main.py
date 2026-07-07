@@ -32,6 +32,7 @@ from backend.db import (
 )
 from backend.crawler import run_crawl_backend, fetch_url_html, is_allowed_by_robots
 from backend.scheduler import start_scheduler, stop_scheduler, register_plan_job, remove_plan_job
+from backend.email_service import send_email as send_email_via_provider
 
 app = FastAPI(title="Insight Flow AI Crawler API")
 
@@ -210,66 +211,27 @@ def create_api_log(payload: dict):
     )
     return {"success": True}
 
-# ── SMTP Mail Sender Proxy ──────────────────────────────
+# ── Mail Sender Proxy (Brevo → Resend → SMTP, same cascade as scheduled sends) ──
 @app.post("/api/send-email")
 def send_email_smtp(payload: dict):
-    smtp_host = payload.get("smtpHost")
-    smtp_port = payload.get("smtpPort")
-    smtp_user = payload.get("smtpUser")
-    smtp_password = payload.get("smtpPassword")
-    sender_email = payload.get("senderEmail") or smtp_user
-    sender_name = payload.get("senderName") or "Insight Flow AI"
     to = payload.get("to")
     subject = payload.get("subject")
     html = payload.get("html")
     plan_id = payload.get("plan_id")
 
-    if not all([smtp_host, smtp_port, smtp_user, smtp_password, to, subject, html]):
-        raise HTTPException(status_code=400, detail="Missing SMTP parameters or email content.")
+    if not all([to, subject, html]):
+        raise HTTPException(status_code=400, detail="Missing recipient, subject, or email content.")
 
-    log_id = f"el_{int(datetime.utcnow().timestamp() * 1000)}"
-    email_log_payload = {
-        "id": log_id,
-        "planId": plan_id,
-        "planName": "Manual Digest" if not plan_id else "",
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "recipient": to,
-        "subject": subject,
-        "articlesCount": payload.get("articles_count", 0),
-        "status": "pending",
-        "error": ""
-    }
+    status, error = send_email_via_provider(
+        to, subject, html,
+        articles_count=payload.get("articles_count", 0),
+        plan_id=plan_id,
+        plan_name="Manual Digest" if not plan_id else "",
+    )
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f'"{sender_name}" <{sender_email}>'
-        msg["To"] = to
-
-        part = MIMEText(html, "html", "utf-8")
-        msg.attach(part)
-
-        port = int(smtp_port)
-        is_ssl = port == 465
-
-        if is_ssl:
-            server = smtplib.SMTP_SSL(smtp_host, port, timeout=30)
-        else:
-            server = smtplib.SMTP(smtp_host, port, timeout=30)
-            server.starttls()
-
-        server.login(smtp_user, smtp_password)
-        server.sendmail(sender_email, [to], msg.as_string())
-        server.quit()
-
-        email_log_payload["status"] = "sent"
-        save_email_log(email_log_payload)
-        return {"success": True}
-    except Exception as e:
-        email_log_payload["status"] = "failed"
-        email_log_payload["error"] = str(e)
-        save_email_log(email_log_payload)
-        raise HTTPException(status_code=500, detail=f"SMTP Send Error: {str(e)}")
+    if status != "sent":
+        raise HTTPException(status_code=500, detail=f"Email send failed: {error}")
+    return {"success": True}
 
 # ── AI Proxy Call ────────────────────────────────────────
 @app.post("/api/call-ai")
