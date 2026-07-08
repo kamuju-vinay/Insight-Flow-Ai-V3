@@ -286,8 +286,32 @@ def summarize_extractive(
     return summary
 
 
+def _strip_html_if_present(text):
+    """Defensive safety net: if raw HTML markup ever ends up in content passed
+    to the summarizer (e.g. an upstream extraction failure), strip it out so
+    tags never leak into a summary shown to the user."""
+    if not text:
+        return text
+    if "<" in text and ">" in text and re.search(r"<[a-zA-Z!/][^>]{0,200}>", text):
+        try:
+            try:
+                soup = BeautifulSoup(text, "lxml")
+            except Exception:
+                soup = BeautifulSoup(text, "html.parser")
+            for tag in soup(["script", "style", "noscript", "svg", "img", "head"]):
+                tag.decompose()
+            cleaned = soup.get_text(separator=" ", strip=True)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                return cleaned
+        except Exception:
+            return re.sub(r"<[^>]+>", " ", text)
+    return text
+
+
 def summarize(content, mode="extractive"):
     """Pluggable summarizer. mode='extractive' (default) or 'llm' (future)."""
+    content = _strip_html_if_present(content)
     if mode == "extractive":
         return summarize_extractive(content)
     raise NotImplementedError(f"Summarizer mode '{mode}' not implemented yet.")
