@@ -296,6 +296,28 @@ def fetch_many(urls, plan_name=None):
 # =============================================================================
 # NEWSPAPER3K ARTICLE EXTRACTION & FALLBACKS
 # =============================================================================
+def _html_to_text(html):
+    """Strip tags/scripts/styles from raw HTML and return clean, readable text.
+    Used as a fallback when newspaper3k fails to parse a page, so raw markup
+    never leaks into summaries or the article content shown in the UI."""
+    if not html:
+        return ""
+    try:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg", "img", "head"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        # collapse repeated whitespace left behind by stripped tags
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+    except Exception:
+        # last-resort fallback: crude tag stripper so we never return raw markup
+        return re.sub(r"<[^>]+>", " ", html)
+
+
 def extract_article_with_newspaper(url, html=None):
     """Extract article text, title, date using newspaper3k with BS4 fallback."""
     try:
@@ -335,7 +357,7 @@ def extract_article_with_newspaper(url, html=None):
         if html:
             return {
                 "title": extract_title_from_html(html),
-                "text": html,
+                "text": _html_to_text(html),
                 "date": extract_date_from_html(html, url),
                 "url": url
             }
