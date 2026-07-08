@@ -16,6 +16,7 @@ import {
   apiGetArticles, apiSaveArticle, apiDeleteArticles, apiDeleteArticleById,
   apiGetEmailLog, apiGetLogs, apiAddLog,
   apiCallAI, apiValidateKey, apiSendEmail, apiFetchUrl, apiClearData, apiClearLogs,
+  apiTestEmail, apiEmailConfigStatus,
   getToken, clearToken, setToken
 } from "./api.js";
 
@@ -113,7 +114,7 @@ function setAIConfig(cfg, dispatch, keyStatuses){
 }
 
 function getOrderedKeys(cfg, keyStatuses = {}) {
-  const providers = ["gemini"];
+  const providers = ["gemini", "huggingface", "groq", "openai", "claude"];
   const tiers = [
     { name: "primary", suffix: "" },
     { name: "secondary", suffix: "_secondary" },
@@ -1054,6 +1055,13 @@ function calculateLocalRelevanceScore(queryText, title, text) {
   return { score, matchedList, totalQueryTerms: queryStems.length, matchesCount: matches };
 }
 
+function capSummaryWords(text, maxWords = 150) {
+  if (!text) return "";
+  const words = text.trim().split(/\s+/);
+  if (words.length <= maxWords) return text.trim();
+  return words.slice(0, maxWords).join(" ").replace(/[,;:]$/, "") + "...";
+}
+
 function summarizeTextLocal(text) {
   if (!text) return "";
   const cleanText = text.replace(/\s+/g, " ").trim();
@@ -1091,7 +1099,7 @@ function summarizeTextLocal(text) {
     return cleanText.slice(0, 150) + (cleanText.length > 150 ? "..." : "");
   }
 
-  return summary.join(" ");
+  return capSummaryWords(summary.join(" "));
 }
 
 
@@ -2206,7 +2214,7 @@ async function runCrawlForPlan(plan, store, dispatch, showToast, onProgress, add
             }
 
             // Summary and key insights are fetched directly from the relevance result!
-            const summary = relResult.summary || summarizeTextLocal(art.text);
+            const summary = capSummaryWords(relResult.summary || summarizeTextLocal(art.text));
             const keyInsights = relResult.key_insights || [];
 
             // 10. Saving accepted article
@@ -2806,7 +2814,7 @@ function Topbar({crumbs,actions}){
 // ── DEFAULT PROMPT ───────────────────────────────────────
 const DEF_PROMPT=`You are an ESG and sustainability intelligence analyst. For each article:
 1. Determine if the article is related to the topics covered by the source URL — if yes process it; if unrelated, skip it.
-2. Summarize the key points in 3–5 sentences.
+2. Summarize the key points in 100–150 words (do not exceed 150 words).
 3. Extract 5–8 relevant keywords.
 4. Classify: ESG / Climate Change / Carbon Emissions / Renewable Energy / Government Regulations / Financial News / Technology / Supply Chain / Risk Management / Other.
 5. Identify regulatory compliance implications (yes/no).
@@ -3554,23 +3562,23 @@ function PlanDetail({plan:init,store,dispatch,onBack,showToast,autoRun}){
     {tab==="prompt"&&(() => {
       const templates = {
         "ESG & Sustainability": {
-          prompt: `You are an ESG and sustainability intelligence analyst. For each article:\n1. Determine if the article is related to the topics covered by the source URL — if yes process it; if unrelated, skip it.\n2. Summarize the key points in 3–5 sentences.\n3. Extract 5–8 relevant keywords.\n4. Classify: ESG / Climate Change / Carbon Emissions / Renewable Energy / Government Regulations / Financial News / Technology / Supply Chain / Risk Management / Other.\n5. Identify regulatory compliance implications (yes/no).\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
+          prompt: `You are an ESG and sustainability intelligence analyst. For each article:\n1. Determine if the article is related to the topics covered by the source URL — if yes process it; if unrelated, skip it.\n2. Summarize the key points in 100–150 words (do not exceed 150 words).\n3. Extract 5–8 relevant keywords.\n4. Classify: ESG / Climate Change / Carbon Emissions / Renewable Energy / Government Regulations / Financial News / Technology / Supply Chain / Risk Management / Other.\n5. Identify regulatory compliance implications (yes/no).\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
           keywords: "esg, sustainability, environment, climate, renewable, carbon, green"
         },
         "Financial News": {
-          prompt: `You are a financial news analyst. For each article:\n1. Determine if the article is related to financial performance, markets, economy, or business earnings — if yes, process it; if unrelated, skip it.\n2. Summarize the key findings in 3–5 sentences.\n3. Extract 5–8 relevant keywords.\n4. Classify: Earnings / Mergers / Markets / Economy / Regulation / Other.\n5. Note market impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
+          prompt: `You are a financial news analyst. For each article:\n1. Determine if the article is related to financial performance, markets, economy, or business earnings — if yes, process it; if unrelated, skip it.\n2. Summarize the key findings in 100–150 words (do not exceed 150 words).\n3. Extract 5–8 relevant keywords.\n4. Classify: Earnings / Mergers / Markets / Economy / Regulation / Other.\n5. Note market impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
           keywords: "finance, revenue, profit, earnings, market, stock, economy, merger"
         },
         "Tech Trends": {
-          prompt: `You are a technology analyst. For each article:\n1. Determine if the article is related to technology innovation, software, AI, or digital transformation — if yes, process it; if unrelated, skip it.\n2. Summarize the key trends in 3–5 sentences.\n3. Extract 5–8 relevant keywords.\n4. Classify: AI / Software / Hardware / Cybersecurity / Cloud / Other.\n5. Note tech adoption impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
+          prompt: `You are a technology analyst. For each article:\n1. Determine if the article is related to technology innovation, software, AI, or digital transformation — if yes, process it; if unrelated, skip it.\n2. Summarize the key trends in 100–150 words (do not exceed 150 words).\n3. Extract 5–8 relevant keywords.\n4. Classify: AI / Software / Hardware / Cybersecurity / Cloud / Other.\n5. Note tech adoption impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
           keywords: "technology, ai, artificial intelligence, software, cybersecurity, cloud, digital"
         },
         "Risk & Compliance": {
-          prompt: `You are a risk and compliance analyst. For each article:\n1. Determine if the article is related to regulatory compliance, audit, legal risk, or security standards — if yes, process it; if unrelated, skip it.\n2. Summarize the key issues in 3–5 sentences.\n3. Extract 5–8 relevant keywords.\n4. Classify: Regulation / Audit / Legal / Security / Compliance / Other.\n5. Note compliance risk.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
+          prompt: `You are a risk and compliance analyst. For each article:\n1. Determine if the article is related to regulatory compliance, audit, legal risk, or security standards — if yes, process it; if unrelated, skip it.\n2. Summarize the key issues in 100–150 words (do not exceed 150 words).\n3. Extract 5–8 relevant keywords.\n4. Classify: Regulation / Audit / Legal / Security / Compliance / Other.\n5. Note compliance risk.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
           keywords: "risk, compliance, regulation, legal, audit, policy, standard, law"
         },
         "Supply Chain": {
-          prompt: `You are a supply chain analyst. For each article:\n1. Determine if the article is related to logistics, shipping, supply chain disruptions, or inventory management — if yes, process it; if unrelated, skip it.\n2. Summarize the key points in 3–5 sentences.\n3. Extract 5–8 relevant keywords.\n4. Classify: Logistics / Shipment / Inventory / Disruption / Vendor / Other.\n5. Note supply chain impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
+          prompt: `You are a supply chain analyst. For each article:\n1. Determine if the article is related to logistics, shipping, supply chain disruptions, or inventory management — if yes, process it; if unrelated, skip it.\n2. Summarize the key points in 100–150 words (do not exceed 150 words).\n3. Extract 5–8 relevant keywords.\n4. Classify: Logistics / Shipment / Inventory / Disruption / Vendor / Other.\n5. Note supply chain impact.\n6. Write a 2-sentence executive summary.\nRespond in structured JSON format.`,
           keywords: "supply chain, logistics, shipping, inventory, vendor, supplier, transit"
         }
       };
@@ -4599,9 +4607,9 @@ function DashboardPage({store, dispatch}){
     const filtered = articles.filter(a => {
       const matchesPlan = selectedPlanId === "all" || a.plan_id === selectedPlanId;
       const matchesUrl = !urlFilter || 
-        a.url.toLowerCase().includes(urlFilter.toLowerCase()) || 
-        a.company.toLowerCase().includes(urlFilter.toLowerCase()) ||
-        (urlLabel && a.company.toLowerCase().includes(urlLabel.toLowerCase()));
+        (a.url||"").toLowerCase().includes(urlFilter.toLowerCase()) || 
+        (a.company||"").toLowerCase().includes(urlFilter.toLowerCase()) ||
+        (urlLabel && (a.company||"").toLowerCase().includes(urlLabel.toLowerCase()));
       return matchesPlan && matchesUrl;
     });
     return filtered.length;
@@ -4620,9 +4628,9 @@ function DashboardPage({store, dispatch}){
     const urlSelectedCount = articles.filter(a => 
       (selectedPlanId === "all" || a.plan_id === selectedPlanId) && 
       (!urlFilter || 
-        a.url.toLowerCase().includes(urlFilter.toLowerCase()) || 
-        a.company.toLowerCase().includes(urlFilter.toLowerCase()) || 
-        (urlLabel && a.company.toLowerCase().includes(urlLabel.toLowerCase()))
+        (a.url||"").toLowerCase().includes(urlFilter.toLowerCase()) || 
+        (a.company||"").toLowerCase().includes(urlFilter.toLowerCase()) || 
+        (urlLabel && (a.company||"").toLowerCase().includes(urlLabel.toLowerCase()))
       )
     ).length;
     
@@ -4679,12 +4687,24 @@ function DashboardPage({store, dispatch}){
   ];
   const maxVal = Math.max(1, ...usages.map(u => u.val));
 
+  // Top Sources (replaces the always-empty "API Calls by LLM Provider" chart)
+  const topSources = (() => {
+    const filtered = articles.filter(a => (selectedPlanId === "all" || a.plan_id === selectedPlanId) && (!urlFilter || (a.url||"").toLowerCase().includes(urlFilter.toLowerCase()) || (a.company||"").toLowerCase().includes(urlFilter.toLowerCase()) || (urlLabel && (a.company||"").toLowerCase().includes(urlLabel.toLowerCase()))));
+    const counts = {};
+    filtered.forEach(a => {
+      const src = a.company || "Unknown source";
+      counts[src] = (counts[src] || 0) + 1;
+    });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count }));
+  })();
+  const maxSourceCount = Math.max(1, ...topSources.map(s => s.count));
+
   // Filter plan lists
   const byPlan = plans.map(p => ({
     name: p.name,
     icon: p.icon,
     bg: p.bg,
-    articles: articles.filter(a => a.plan_id === p.id && (!urlFilter || a.url.toLowerCase().includes(urlFilter.toLowerCase()) || a.company.toLowerCase().includes(urlFilter.toLowerCase()) || (urlLabel && a.company.toLowerCase().includes(urlLabel.toLowerCase())))).length,
+    articles: articles.filter(a => a.plan_id === p.id && (!urlFilter || (a.url||"").toLowerCase().includes(urlFilter.toLowerCase()) || (a.company||"").toLowerCase().includes(urlFilter.toLowerCase()) || (urlLabel && (a.company||"").toLowerCase().includes(urlLabel.toLowerCase())))).length,
     emails: emailLog.filter(e => e.plan_id === p.id).length,
     status: p.status,
     lastRun: p.lastRun
@@ -4694,7 +4714,7 @@ function DashboardPage({store, dispatch}){
   const maxA = Math.max(1, ...byPlan.map(b => b.articles));
 
   const recentArts = [...articles]
-    .filter(a => (selectedPlanId === "all" || a.plan_id === selectedPlanId) && (!urlFilter || a.url.toLowerCase().includes(urlFilter.toLowerCase()) || a.company.toLowerCase().includes(urlFilter.toLowerCase()) || (urlLabel && a.company.toLowerCase().includes(urlLabel.toLowerCase()))))
+    .filter(a => (selectedPlanId === "all" || a.plan_id === selectedPlanId) && (!urlFilter || (a.url||"").toLowerCase().includes(urlFilter.toLowerCase()) || (a.company||"").toLowerCase().includes(urlFilter.toLowerCase()) || (urlLabel && (a.company||"").toLowerCase().includes(urlLabel.toLowerCase()))))
     .reverse()
     .slice(0, 5);
 
@@ -4873,22 +4893,18 @@ function DashboardPage({store, dispatch}){
       </Card>
       <Card style={{display:"flex",flexDirection:"column"}}>
         <div style={{fontSize:13,fontWeight:700,marginBottom:14,display:"flex",alignItems:"center",gap:6}}>
-          <BarChart3 size={15} color={C.accent}/> API Calls by LLM Provider
+          <BarChart3 size={15} color={C.accent}/> Top Sources
         </div>
-        <div style={{display:"flex",justifyContent:"center",alignItems:"flex-end",flex:1,paddingBottom:5}}>
-          <svg width="280" height="135" viewBox="0 0 280 135">
-            <line x1="12" y1="110" x2="268" y2="110" stroke={C.line2} strokeWidth="1" />
-            {usages.map((u, idx) => {
-              const x = 24 + idx * 50;
-              const h = maxVal !== 0 ? (u.val / maxVal) * 80 : 0;
-              return <g key={u.label}>
-                <rect x={x} y={110 - h} width="22" height={Math.max(2, h)} rx="3" ry="3" fill={u.color} style={{ transition: "all .3s ease" }} />
-                <text x={x + 11} y={110 - h - 5} textAnchor="middle" style={{ fontSize: "9px", fontWeight: "700", fill: C.ink }}>{u.val}</text>
-                <text x={x + 11} y="124" textAnchor="middle" style={{ fontSize: "9px", fontWeight: "600", fill: C.ink3 }}>{u.label}</text>
-              </g>;
-            })}
-          </svg>
-        </div>
+        {topSources.length===0 && <div style={{fontSize:12,color:C.ink3,textAlign:"center",padding:"20px 0",flex:1,display:"flex",alignItems:"center",justifyContent:"center"}}>No articles yet</div>}
+        {topSources.length>0 && <div style={{display:"flex",flexDirection:"column",gap:10,flex:1,justifyContent:"center"}}>
+          {topSources.map(s=><div key={s.name}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4,alignItems:"center"}}>
+              <span style={{fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:180}}>{s.name}</span>
+              <span style={{color:C.ink3}}>{s.count} article{s.count===1?"":"s"}</span>
+            </div>
+            <ProgBar pct={(s.count/maxSourceCount)*100}/>
+          </div>)}
+        </div>}
       </Card>
     </div>
 
@@ -5012,11 +5028,11 @@ function SettingsPage({store,dispatch,showToast}){
   const [outlookName, setOutlookName] = useLocalStorage("if_settings_outlookName", cfg.outlook_sender_name || (cfg.active_smtp_provider !== "gmail" ? cfg.sender_name : "") || "Insight Flow AI");
 
   // Gmail fields
-  const [gmailHost, setGmailHost] = useLocalStorage("if_settings_gmailHost", cfg.gmail_smtp_host || "smtp.gmail.com");
+  const [gmailHost, setGmailHost] = useLocalStorage("if_settings_gmailHost", cfg.gmail_smtp_host || "smtp-relay.brevo.com");
   const [gmailPort, setGmailPort] = useLocalStorage("if_settings_gmailPort", cfg.gmail_smtp_port || "587");
-  const [gmailUser, setGmailUser] = useLocalStorage("if_settings_gmailUser", cfg.gmail_smtp_user || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_user : "") || "");
+  const [gmailUser, setGmailUser] = useLocalStorage("if_settings_gmailUser", cfg.gmail_smtp_user || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_user : "") || "b11887001@smtp-brevo.com");
   const [gmailPass, setGmailPass] = useLocalStorage("if_settings_gmailPass", cfg.gmail_smtp_password || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_password : "") || "");
-  const [gmailFrom, setGmailFrom] = useLocalStorage("if_settings_gmailFrom", cfg.gmail_sender_email || (cfg.active_smtp_provider === "gmail" ? cfg.sender_email : "") || "");
+  const [gmailFrom, setGmailFrom] = useLocalStorage("if_settings_gmailFrom", cfg.gmail_sender_email || (cfg.active_smtp_provider === "gmail" ? cfg.sender_email : "") || "b11887001@smtp-brevo.com");
   const [gmailName, setGmailName] = useLocalStorage("if_settings_gmailName", cfg.gmail_sender_name || (cfg.active_smtp_provider === "gmail" ? cfg.sender_name : "") || "Insight Flow AI");
 
   // Global auto-email schedule
@@ -5076,11 +5092,11 @@ function SettingsPage({store,dispatch,showToast}){
       if (outlookFrom === prev.outlook_sender_email) setOutlookFrom(cfg.outlook_sender_email || (cfg.active_smtp_provider !== "gmail" ? cfg.sender_email : "") || "");
       if (outlookName === prev.outlook_sender_name) setOutlookName(cfg.outlook_sender_name || (cfg.active_smtp_provider !== "gmail" ? cfg.sender_name : "") || "Insight Flow AI");
 
-      if (gmailHost === prev.gmail_smtp_host) setGmailHost(cfg.gmail_smtp_host || "smtp.gmail.com");
+      if (gmailHost === prev.gmail_smtp_host) setGmailHost(cfg.gmail_smtp_host || "smtp-relay.brevo.com");
       if (gmailPort === prev.gmail_smtp_port) setGmailPort(cfg.gmail_smtp_port || "587");
-      if (gmailUser === prev.gmail_smtp_user) setGmailUser(cfg.gmail_smtp_user || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_user : "") || "");
+      if (gmailUser === prev.gmail_smtp_user) setGmailUser(cfg.gmail_smtp_user || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_user : "") || "b11887001@smtp-brevo.com");
       if (gmailPass === prev.gmail_smtp_password) setGmailPass(cfg.gmail_smtp_password || (cfg.active_smtp_provider === "gmail" ? cfg.smtp_password : "") || "");
-      if (gmailFrom === prev.gmail_sender_email) setGmailFrom(cfg.gmail_sender_email || (cfg.active_smtp_provider === "gmail" ? cfg.sender_email : "") || "");
+      if (gmailFrom === prev.gmail_sender_email) setGmailFrom(cfg.gmail_sender_email || (cfg.active_smtp_provider === "gmail" ? cfg.sender_email : "") || "b11887001@smtp-brevo.com");
       if (gmailName === prev.gmail_sender_name) setGmailName(cfg.gmail_sender_name || (cfg.active_smtp_provider === "gmail" ? cfg.sender_name : "") || "Insight Flow AI");
 
       if (autoEmail === prev.auto_email) setAutoEmail(cfg.auto_email || false);
@@ -5194,6 +5210,29 @@ function SettingsPage({store,dispatch,showToast}){
     showToast("SMTP settings saved","success");
   };
   const saveAutoEmail=()=>{dispatch({type:"UPD_CFG",changes:{auto_email:autoEmail,auto_email_time:autoEmailTime,auto_email_days:autoEmailDays}});showToast("Auto-mail schedule saved","success");};
+
+  // ── Brevo test email ──
+  const[brevoStatus,setBrevoStatus]=useState(null); // {configured, fromEmail, fromName}
+  const[testEmailTo,setTestEmailTo]=useState("");
+  const[testEmailSending,setTestEmailSending]=useState(false);
+  useEffect(()=>{
+    apiEmailConfigStatus().then(setBrevoStatus).catch(()=>setBrevoStatus({configured:false}));
+  },[]);
+  const sendTestEmail=async()=>{
+    if(!testEmailTo || !testEmailTo.includes("@")){
+      showToast("Enter a valid email address","error");
+      return;
+    }
+    setTestEmailSending(true);
+    try{
+      const res=await apiTestEmail(testEmailTo);
+      showToast("Test email sent","success",{sub:res.messageId?`Brevo message ID: ${res.messageId}`:undefined});
+    }catch(e){
+      showToast("Test email failed","error",{sub:e.message});
+    }finally{
+      setTestEmailSending(false);
+    }
+  };
 
   const saveCrawlerSettings = () => {
     try {
@@ -5436,6 +5475,25 @@ function SettingsPage({store,dispatch,showToast}){
         })()}
         
         <Btn primary sm icon={Save} onClick={saveSMTP}>Save SMTP Settings</Btn>
+      </Card>
+
+      {/* ── Brevo Email Delivery (production email sender — Railway blocks SMTP) ── */}
+      <Card>
+        <div style={{fontSize:13,fontWeight:700,marginBottom:4,display:"flex",alignItems:"center",gap:6}}><Mail size={15} color={C.accent}/> Email Delivery (Brevo)</div>
+        <div style={{fontSize:11,color:C.ink3,marginBottom:12}}>Scheduled digests and manual sends actually go out through the Brevo REST API over HTTPS, configured via BREVO_API_KEY / BREVO_FROM_EMAIL / BREVO_FROM_NAME in Railway → Variables. The SMTP fields above are not used for delivery.</div>
+
+        {brevoStatus && (
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,padding:"8px 10px",background:brevoStatus.configured?C.greenBg:C.amberBg,borderRadius:8}}>
+            {brevoStatus.configured
+              ?<><CheckCircle2 size={14} color={C.green}/><span style={{fontSize:11,color:C.green,fontWeight:600}}>Brevo is configured — sending as {brevoStatus.fromName} &lt;{brevoStatus.fromEmail}&gt;</span></>
+              :<><AlertTriangle size={14} color={C.amber}/><span style={{fontSize:11,color:C.amber,fontWeight:600}}>BREVO_API_KEY / BREVO_FROM_EMAIL are not set in Railway → Variables</span></>}
+          </div>
+        )}
+
+        <FormRow label="Send a test email to">
+          <Inp value={testEmailTo} onChange={setTestEmailTo} placeholder="you@example.com"/>
+        </FormRow>
+        <Btn primary sm icon={Send} disabled={testEmailSending} onClick={sendTestEmail}>{testEmailSending?"Sending…":"Send Test Email"}</Btn>
       </Card>
       
       {/* ── Configure Crawler Engine (Hidden) ──
