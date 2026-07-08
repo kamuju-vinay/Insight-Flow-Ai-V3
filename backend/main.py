@@ -2,11 +2,8 @@ import os
 import re
 import json
 import logging
-import smtplib
 import sys
 import io
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -33,7 +30,7 @@ from backend.db import (
 )
 from backend.crawler import run_crawl_backend, fetch_url_html, is_allowed_by_robots
 from backend.scheduler import start_scheduler, stop_scheduler, register_plan_job, remove_plan_job
-from backend.email_service import send_email as send_email_via_provider
+from backend.email_service import send_html_email, send_notification, get_brevo_config
 
 
 @asynccontextmanager
@@ -215,9 +212,12 @@ def create_api_log(payload: dict):
     )
     return {"success": True}
 
-# ── Mail Sender Proxy (Brevo → Resend → SMTP, same cascade as scheduled sends) ──
+# ── Mail Sender (Brevo REST API only — SMTP/Resend are not used) ──────────
 @app.post("/api/send-email")
-def send_email_smtp(payload: dict):
+def send_email_endpoint(payload: dict):
+    """General-purpose send used by the frontend's manual "Send Now" flow
+    and by the standalone email test page. Supports cc/bcc/attachments so
+    it doubles as the endpoint behind the Settings → Test Email UI."""
     to = payload.get("to")
     subject = payload.get("subject")
     html = payload.get("html")
@@ -226,16 +226,55 @@ def send_email_smtp(payload: dict):
     if not all([to, subject, html]):
         raise HTTPException(status_code=400, detail="Missing recipient, subject, or email content.")
 
-    status, error = send_email_via_provider(
+    result = send_html_email(
         to, subject, html,
+        cc=payload.get("cc"),
+        bcc=payload.get("bcc"),
+        attachments=payload.get("attachments"),
         articles_count=payload.get("articles_count", 0),
         plan_id=plan_id,
         plan_name="Manual Digest" if not plan_id else "",
     )
 
-    if status != "sent":
-        raise HTTPException(status_code=500, detail=f"Email send failed: {error}")
-    return {"success": True}
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=f"Email send failed: {result['error']}")
+    return {"success": True, "messageId": result["messageId"], "status": "Email Sent"}
+
+
+@app.get("/api/email-config-status")
+def email_config_status():
+    """Lets the frontend show a clear "Brevo is/isn't configured" banner
+    without exposing the actual API key."""
+    cfg = get_brevo_config()
+    return {
+        "configured": bool(cfg["api_key"] and cfg["from_email"]),
+        "fromEmail": cfg["from_email"],
+        "fromName": cfg["from_name"],
+    }
+
+
+@app.post("/api/test-email")
+def test_email_endpoint(payload: dict = None):
+    """Sends a sample email to verify the Brevo integration end-to-end.
+    Body: { "to": "someone@example.com" } — subject/body are fixed so this
+    stays a pure connectivity/deliverability check."""
+    payload = payload or {}
+    to = payload.get("to")
+    if not to:
+        raise HTTPException(status_code=400, detail="Missing recipient email address (\"to\").")
+
+    result = send_notification(
+        to,
+        subject="Insight Flow AI — Test Email",
+        message=(
+            "This is a test email from Insight Flow AI, sent via the Brevo REST API. "
+            "If you received this, your Brevo integration on Railway is working correctly."
+        ),
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=f"Test email failed: {result['error']}")
+    return {"success": True, "messageId": result["messageId"], "status": "Email Sent"}
 
 # ── AI Proxy Call ────────────────────────────────────────
 @app.post("/api/call-ai")
