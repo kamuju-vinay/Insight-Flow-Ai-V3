@@ -1176,16 +1176,17 @@ def _save_records(records, plan, plan_name, plan_id, prompt_enabled, prompt, thr
             "plan_id": plan_id,
             "title": r.get("Title", ""),
             "url": url,
-            "publishedDate": r.get("Published Date", ""),
+            "pubDate": r.get("Published Date", ""),
             "summary": r.get("Summary", ""),
             "content": "",
-            "source": "",
+            "author": r.get("Source") or urlparse(url).netloc,
             "canonicalUrl": url,
             "metaDescription": "",
             "createdAt": datetime.utcnow().isoformat() + "Z",
             "metadata": {
                 "relevance_score": r.get("relevance_score", 100),
                 "relevance_reason": r.get("relevance_reason", "Matched date range"),
+                "company": r.get("Source") or urlparse(url).netloc,
             }
         }
         save_article(article)
