@@ -7,20 +7,17 @@ of whether the send was triggered by the browser or by this backend's
 scheduler. Do not change the HTML/CSS below without also updating App.jsx,
 or the two will drift apart.
 
-Email provider: Resend is used first (RESEND_API_KEY). If it's not
-configured, or the send fails, we fall back to SMTP using the same
-settings the app's Settings page already stores (smtp_host, smtp_port,
-smtp_user, smtp_password, sender_email, sender_name).
+Email provider: Brevo REST API (HTTPS) only. Railway blocks outbound SMTP
+ports, so SMTP and Resend are intentionally not used anywhere in this
+module. See BREVO_API_KEY / BREVO_FROM_EMAIL / BREVO_FROM_NAME in Railway →
+Variables.
 """
 import os
 import re
+import time
 import base64
 import logging
-import smtplib
 from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
 
 import httpx
 
@@ -28,7 +25,6 @@ from backend.db import get_settings, save_email_log
 
 log = logging.getLogger(__name__)
 
-RESEND_API_URL = "https://api.resend.com/emails"
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 LOGO_CANDIDATES = [
@@ -178,7 +174,7 @@ def compile_email_html(plan, articles):
     """Python port of compileEmailHtml(plan, articles) from src/App.jsx."""
     plan_name = plan.get("name") or "ESG Application"
     date_str = datetime.now().strftime("%-d %b %Y") if os.name != "nt" else datetime.now().strftime("%#d %b %Y")
-    logo_src = "cid:logo"
+    logo_src = "cid:logo.png"
     articles_list_html = "".join(_article_row(a, i) for i, a in enumerate(articles) if a)
     count_label = f"{len(articles)} New Article{'' if len(articles) == 1 else 's'}"
     plan_name_esc = escape_html(plan_name)
@@ -318,155 +314,281 @@ def compile_email_html(plan, articles):
 """
 
 
-# ── Sending ──────────────────────────────────────────────────────────────
-def _send_via_resend(to, subject, html, sender_name, sender_email, api_key):
-    payload = {
-        "from": f"{sender_name} <{sender_email}>",
-        "to": [to],
-        "subject": subject,
-        "html": html,
-    }
-    logo_path = _find_logo()
-    if logo_path:
-        with open(logo_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        payload["attachments"] = [{"filename": "logo.png", "content": b64, "content_id": "logo"}]
-
-    resp = httpx.post(
-        RESEND_API_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
-    return resp.json()
+# ── Sending (Brevo REST API only — no SMTP, no Resend) ─────────────────
+# Railway blocks outbound SMTP ports, so all mail goes out over HTTPS via
+# Brevo's transactional email API. Credentials are read exclusively from
+# environment variables (BREVO_API_KEY / BREVO_FROM_EMAIL / BREVO_FROM_NAME) —
+# never hardcoded, never required to be stored in the app DB.
+MAX_SEND_RETRIES = 3
+RETRY_BACKOFF_BASE_SECONDS = 2  # 2s, 4s, 8s
+REQUEST_TIMEOUT_SECONDS = 30
 
 
-def _send_via_brevo(to, subject, html, sender_name, sender_email, api_key):
-    payload = {
-        "sender": {"name": sender_name, "email": sender_email},
-        "to": [{"email": to}],
-        "subject": subject,
-        "htmlContent": html,
-    }
-    logo_path = _find_logo()
-    if logo_path:
-        with open(logo_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        payload["attachment"] = [{"content": b64, "name": "logo.png"}]
-
-    resp = httpx.post(
-        BREVO_API_URL,
-        headers={"api-key": api_key, "Content-Type": "application/json", "Accept": "application/json"},
-        json=payload,
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Brevo error {resp.status_code}: {resp.text}")
-    return resp.json()
+class BrevoConfigError(RuntimeError):
+    """Raised when Brevo credentials are missing/incomplete."""
 
 
-def _send_via_smtp(to, subject, html, cfg):
-    smtp_host = cfg.get("smtp_host")
-    smtp_port = int(cfg.get("smtp_port") or 587)
-    smtp_user = cfg.get("smtp_user")
-    smtp_password = cfg.get("smtp_password")
-    sender_email = cfg.get("sender_email") or smtp_user
-    sender_name = cfg.get("sender_name") or "Insight Flow AI"
+class BrevoSendError(RuntimeError):
+    """Raised when Brevo rejects a send after retries are exhausted."""
 
-    if not all([smtp_host, smtp_user, smtp_password]):
-        raise RuntimeError("SMTP is not configured (set smtp_host/smtp_user/smtp_password in Settings).")
 
-    msg = MIMEMultipart("related")
-    msg["Subject"] = subject
-    msg["From"] = f'"{sender_name}" <{sender_email}>'
-    msg["To"] = to
-
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(html, "html", "utf-8"))
-    msg.attach(alt)
-
-    logo_path = _find_logo()
-    if logo_path:
-        with open(logo_path, "rb") as f:
-            img = MIMEImage(f.read())
-        img.add_header("Content-ID", "<logo>")
-        img.add_header("Content-Disposition", "inline", filename="logo.png")
-        msg.attach(img)
-
-    is_ssl = smtp_port == 465
-    server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) if is_ssl else smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+def get_brevo_config():
+    """Reads Brevo credentials. Environment variables are the source of
+    truth (see Railway → Variables); DB settings are only used as an
+    optional convenience fallback for the sender display name/email so the
+    Settings UI can still show something meaningful."""
+    cfg = {}
     try:
-        if not is_ssl:
-            server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(sender_email, [to], msg.as_string())
-    finally:
-        server.quit()
+        cfg = get_settings() or {}
+    except Exception:
+        cfg = {}
+    return {
+        "api_key": os.environ.get("BREVO_API_KEY"),
+        "from_email": os.environ.get("BREVO_FROM_EMAIL") or cfg.get("brevo_from_email"),
+        "from_name": os.environ.get("BREVO_FROM_NAME") or cfg.get("brevo_from_name") or "Insight Flow AI",
+    }
 
 
-def send_email(to, subject, html, articles_count=0, plan_id=None, plan_name=""):
-    """Sends one email. Tries Brevo first, then Resend, then SMTP. Always logs to email_log."""
-    cfg = get_settings()
-    brevo_key = cfg.get("brevo_api_key") or os.environ.get("BREVO_API_KEY")
-    resend_key = cfg.get("resend_api_key") or os.environ.get("RESEND_API_KEY")
-    sender_email = (
-        cfg.get("brevo_from_email")
-        or os.environ.get("BREVO_FROM_EMAIL")
-        or cfg.get("resend_from_email")
-        or os.environ.get("RESEND_FROM_EMAIL")
-        or cfg.get("sender_email")
-        or "onboarding@resend.dev"
-    )
-    sender_name = (
-        cfg.get("brevo_from_name")
-        or cfg.get("resend_from_name")
-        or cfg.get("sender_name")
-        or "Insight Flow AI"
-    )
+def _as_list(value):
+    if not value:
+        return []
+    return value if isinstance(value, list) else [value]
 
-    log_id = f"el_{int(datetime.utcnow().timestamp() * 1000)}"
-    status, error = "pending", ""
-    errors = []
 
-    providers = []
-    if brevo_key:
-        providers.append(("brevo", lambda: _send_via_brevo(to, subject, html, sender_name, sender_email, brevo_key)))
-    if resend_key:
-        providers.append(("resend", lambda: _send_via_resend(to, subject, html, sender_name, sender_email, resend_key)))
-    providers.append(("smtp", lambda: _send_via_smtp(to, subject, html, cfg)))
+def _as_email_objects(value):
+    return [{"email": e} for e in _as_list(value)]
 
-    for name, send_fn in providers:
+
+def _build_attachments(attachments=None, inline_images=None):
+    """Builds Brevo's flat `attachment` array. Regular attachments and
+    inline images use the same shape — inline images are distinguished by
+    their `name` matching a `cid:<name>` reference inside the HTML body."""
+    out = []
+    for a in _as_list(attachments):
         try:
-            send_fn()
-            status = "sent"
-            break
-        except Exception as e:
-            errors.append(f"{name} failed ({e})")
-            status = "failed"
+            if a.get("content_base64"):
+                b64 = a["content_base64"]
+            elif a.get("path"):
+                with open(a["path"], "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+            elif isinstance(a.get("content"), (bytes, bytearray)):
+                b64 = base64.b64encode(a["content"]).decode("ascii")
+            else:
+                log.warning("Skipping attachment with no content/path/content_base64: %s", a.get("filename"))
+                continue
+            out.append({"content": b64, "name": a.get("filename") or a.get("name") or "attachment"})
+        except OSError as e:
+            log.warning("Could not read attachment %s: %s", a.get("path") or a.get("filename"), e)
 
-    error = "; ".join(errors) if status != "sent" else ""
+    for img in _as_list(inline_images):
+        try:
+            if img.get("content_base64"):
+                b64 = img["content_base64"]
+            elif img.get("path"):
+                with open(img["path"], "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+            else:
+                continue
+            name = img.get("cid") or img.get("name") or "image"
+            out.append({"content": b64, "name": name})
+        except OSError as e:
+            log.warning("Could not read inline image %s: %s", img.get("path"), e)
 
-    save_email_log({
-        "id": log_id,
-        "planId": plan_id,
-        "planName": plan_name or ("Manual Digest" if not plan_id else ""),
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "recipient": to,
+    return out
+
+
+def _post_to_brevo(payload, api_key):
+    """POSTs to the Brevo API with retry/backoff for transient failures.
+    Retries on: network errors, timeouts, HTTP 429, HTTP 5xx.
+    Fails immediately (no retry) on: HTTP 4xx other than 429 — these are
+    caused by bad payloads / invalid recipients / bad API keys and won't
+    succeed on retry."""
+    last_error = None
+
+    for attempt in range(1, MAX_SEND_RETRIES + 1):
+        try:
+            resp = httpx.post(
+                BREVO_API_URL,
+                headers={
+                    "api-key": api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except httpx.TimeoutException as e:
+            last_error = f"Brevo request timed out: {e}"
+        except httpx.RequestError as e:
+            last_error = f"Network error calling Brevo: {e}"
+        else:
+            if resp.status_code < 300:
+                try:
+                    return resp.json()
+                except ValueError:
+                    return {}
+
+            try:
+                err_body = resp.json()
+            except ValueError:
+                err_body = {"message": resp.text}
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else RETRY_BACKOFF_BASE_SECONDS ** attempt
+                last_error = f"Brevo rate limit (429): {err_body}"
+                if attempt < MAX_SEND_RETRIES:
+                    log.warning("Brevo rate-limited, retrying in %.1fs (attempt %d/%d)", wait, attempt, MAX_SEND_RETRIES)
+                    time.sleep(wait)
+                    continue
+                raise BrevoSendError(last_error)
+
+            if 500 <= resp.status_code < 600:
+                last_error = f"Brevo server error ({resp.status_code}): {err_body}"
+                if attempt < MAX_SEND_RETRIES:
+                    wait = RETRY_BACKOFF_BASE_SECONDS ** attempt
+                    log.warning("Brevo 5xx, retrying in %ds (attempt %d/%d)", wait, attempt, MAX_SEND_RETRIES)
+                    time.sleep(wait)
+                    continue
+                raise BrevoSendError(last_error)
+
+            # 4xx (invalid recipient, bad API key, malformed payload, etc.) — don't retry.
+            raise BrevoSendError(f"Brevo rejected the request ({resp.status_code}): {err_body}")
+
+        # Network/timeout error path — retry with backoff.
+        if attempt < MAX_SEND_RETRIES:
+            wait = RETRY_BACKOFF_BASE_SECONDS ** attempt
+            log.warning("%s — retrying in %ds (attempt %d/%d)", last_error, wait, attempt, MAX_SEND_RETRIES)
+            time.sleep(wait)
+            continue
+
+    raise BrevoSendError(last_error or "Unknown Brevo send failure after retries")
+
+
+def send_email(
+    to,
+    subject,
+    html=None,
+    text=None,
+    cc=None,
+    bcc=None,
+    attachments=None,
+    inline_images=None,
+    reply_to=None,
+    tags=None,
+    plan_id=None,
+    plan_name="",
+    articles_count=0,
+):
+    """Low-level, reusable sender used by every other helper in this module.
+    `to`/`cc`/`bcc` accept a single email string or a list of strings.
+    Always writes a row to email_log (sent or failed) so /api/email-log and
+    the Logs page have full visibility into every attempt.
+
+    Returns: {"success": bool, "messageId": str|None, "status": "sent"|"failed", "error": str|None}
+    """
+    if not html and not text:
+        raise ValueError("send_email requires either `html` or `text` content.")
+
+    cfg = get_brevo_config()
+    recipients = _as_list(to)
+    recipient_label = ", ".join(recipients)
+    ts = datetime.utcnow().isoformat() + "Z"
+    log_id = f"el_{int(datetime.utcnow().timestamp() * 1000)}"
+
+    def _log_and_return(success, message_id, error):
+        save_email_log({
+            "id": log_id,
+            "planId": plan_id,
+            "planName": plan_name or ("Manual Digest" if not plan_id else ""),
+            "ts": ts,
+            "recipient": recipient_label,
+            "subject": subject,
+            "articlesCount": articles_count,
+            "status": "sent" if success else "failed",
+            "error": error or "",
+            "messageId": message_id,
+        })
+        return {
+            "success": success,
+            "messageId": message_id,
+            "status": "sent" if success else "failed",
+            "error": error,
+        }
+
+    if not cfg["api_key"] or not cfg["from_email"]:
+        error = (
+            "Brevo is not configured. Set BREVO_API_KEY and BREVO_FROM_EMAIL "
+            "as environment variables in Railway → Variables, then redeploy."
+        )
+        log.error(error)
+        return _log_and_return(False, None, error)
+
+    payload = {
+        "sender": {"name": cfg["from_name"], "email": cfg["from_email"]},
+        "to": _as_email_objects(recipients),
         "subject": subject,
-        "articlesCount": articles_count,
-        "status": status,
-        "error": error,
-    })
-    if status != "sent":
-        log.warning("Email to %s failed: %s", to, error)
-    return status, error
+    }
+    if html:
+        payload["htmlContent"] = html
+    if text:
+        payload["textContent"] = text
+    if cc:
+        payload["cc"] = _as_email_objects(cc)
+    if bcc:
+        payload["bcc"] = _as_email_objects(bcc)
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
+    if tags:
+        payload["tags"] = _as_list(tags)
+
+    attach = _build_attachments(attachments, inline_images)
+    if attach:
+        payload["attachment"] = attach
+
+    log.info("Sending email via Brevo | to=%s | subject=%s", recipient_label, subject)
+    try:
+        result = _post_to_brevo(payload, cfg["api_key"])
+        message_id = result.get("messageId") if isinstance(result, dict) else None
+        log.info("Brevo send succeeded | to=%s | messageId=%s", recipient_label, message_id)
+        return _log_and_return(True, message_id, None)
+    except Exception as e:
+        error = str(e)
+        log.error("Brevo send failed | to=%s | subject=%s | error=%s", recipient_label, subject, error)
+        return _log_and_return(False, None, error)
+
+
+def send_html_email(to, subject, html, **kwargs):
+    """Convenience wrapper: send a pre-built HTML email."""
+    return send_email(to, subject, html=html, **kwargs)
+
+
+def send_report(to, subject, html, plan_id=None, plan_name="", articles_count=0, cc=None, bcc=None):
+    """Sends an ESG digest / report email, auto-attaching the inline logo
+    referenced as cid:logo.png inside compile_email_html()."""
+    inline_images = None
+    logo_path = _find_logo()
+    if logo_path:
+        inline_images = [{"cid": "logo.png", "path": logo_path}]
+    return send_email(
+        to, subject, html=html, cc=cc, bcc=bcc, inline_images=inline_images,
+        plan_id=plan_id, plan_name=plan_name, articles_count=articles_count,
+    )
+
+
+def send_notification(to, subject, message, html=None, **kwargs):
+    """Sends a simple plain-text style notification (alerts, status pings,
+    scheduler failures, etc.). Pass `html` to override the auto-generated
+    minimal HTML wrapper."""
+    body_html = html or f"<div style='font-family:sans-serif;font-size:14px;color:#0f172a;'>{escape_html(message)}</div>"
+    return send_email(to, subject, html=body_html, text=message, **kwargs)
 
 
 def send_digest_for_plan(plan, articles):
     """Python port of sendEmailForPlan — used by the scheduler and by the
-    "immediate" auto-mail path so digests go out with no browser open."""
+    "immediate" auto-mail path so digests go out with no browser open.
+    Never raises: failures are logged and counted so the scheduler can
+    continue on to the next plan/job."""
     active_groups = [g for g in (plan.get("recipientGroups") or []) if g.get("active")]
     recipients = sorted({e for g in active_groups for e in (g.get("emails") or [])})
 
@@ -478,12 +600,18 @@ def send_digest_for_plan(plan, articles):
 
     sent = failed = 0
     for to in recipients:
-        status, _ = send_email(
-            to, subject, html,
-            articles_count=len(articles), plan_id=plan.get("id"), plan_name=plan.get("name"),
-        )
-        if status == "sent":
-            sent += 1
-        else:
+        try:
+            result = send_report(
+                to, subject, html,
+                plan_id=plan.get("id"), plan_name=plan.get("name"), articles_count=len(articles),
+            )
+            if result["success"]:
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            # Defensive: send_report already catches send errors internally,
+            # but we never want one bad recipient to kill the whole job.
+            log.error("Unexpected error sending digest to %s: %s", to, e)
             failed += 1
     return {"sent": sent, "failed": failed}
