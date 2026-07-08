@@ -185,6 +185,25 @@ export async function apiSendEmail({ planId, to, subject, html, articlesCount })
   return res.json();
 }
 
+export async function apiTestEmail(to) {
+  const res = await apiFetch("/api/test-email", {
+    method: "POST",
+    body: JSON.stringify({ to }),
+  });
+  if (!res) throw new Error("Network error");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || err.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function apiEmailConfigStatus() {
+  const res = await apiFetch("/api/email-config-status");
+  if (!res || !res.ok) return { configured: false };
+  return res.json();
+}
+
 // ── URL proxy ─────────────────────────────────────────────
 export async function apiFetchUrl(url) {
   const res = await apiFetch(`/api/fetch-url?url=${encodeURIComponent(url)}`, {
