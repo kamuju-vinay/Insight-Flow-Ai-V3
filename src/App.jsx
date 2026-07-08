@@ -498,8 +498,26 @@ function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function stripHtmlTags(text) {
+  if (!text) return text;
+  // Defensive safety net: if raw HTML markup ever slipped into stored
+  // summary/content (e.g. from an old crawl before the backend fix),
+  // strip the tags so they never render as visible text in the UI.
+  if (/<[a-zA-Z!/][^>]{0,300}>/.test(text)) {
+    const cleaned = text
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (cleaned) return cleaned;
+  }
+  return text;
+}
+
 function formatMarkdown(text) {
   if (!text) return "";
+  text = stripHtmlTags(text);
   const parts = text.split(/\*\*([^*]+)\*\*/g);
   return parts.map((part, index) => {
     if (index % 2 === 1) {
@@ -540,7 +558,7 @@ function compileEmailHtml(plan, articles, isPreview = false) {
   articlesToRender.forEach((a, index) => {
     if (!a) return;
     const formattedTitle = escapeHtml(a.title || "").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    const formattedSummary = escapeHtml(a.summary || "").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    const formattedSummary = escapeHtml(stripHtmlTags(a.summary || "")).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     const cat = getArticleCategory(a.title, a.summary);
 
     articlesListHtml += `
