@@ -20,6 +20,7 @@ from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HT
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 import httpx
 import pandas as pd
 import io
@@ -34,7 +35,24 @@ from backend.crawler import run_crawl_backend, fetch_url_html, is_allowed_by_rob
 from backend.scheduler import start_scheduler, stop_scheduler, register_plan_job, remove_plan_job
 from backend.email_service import send_email as send_email_via_provider
 
-app = FastAPI(title="Insight Flow AI Crawler API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── startup ──
+    print("🚀 FastAPI App starting...")
+    init_db()
+    start_scheduler()
+    print("✅ Startup initialization complete!")
+
+    yield
+
+    # ── shutdown ──
+    print("🛑 FastAPI App shutting down...")
+    stop_scheduler()
+    print("✅ Shutdown complete!")
+
+
+app = FastAPI(title="Insight Flow AI Crawler API", lifespan=lifespan)
 
 # Configure CORS
 allowed_origins = [
@@ -89,20 +107,6 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-
-# ── Startup and Shutdown Hooks ──────────────────────────
-@app.on_event("startup")
-def startup_event():
-    print("🚀 FastAPI App starting...")
-    init_db()
-    start_scheduler()
-    print("✅ Startup initialization complete!")
-
-@app.on_event("shutdown")
-def shutdown_event():
-    print("🛑 FastAPI App shutting down...")
-    stop_scheduler()
-    print("✅ Shutdown complete!")
 
 # ── Auth Endpoints ───────────────────────────────────────
 @app.post("/api/auth/login")
