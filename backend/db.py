@@ -110,9 +110,16 @@ def init_db():
         subject TEXT,
         articles_count INTEGER,
         status TEXT,
-        error TEXT
+        error TEXT,
+        message_id TEXT
     )
     """)
+    # Migration: add message_id to pre-existing email_log tables that were
+    # created before this column existed.
+    try:
+        cursor.execute("ALTER TABLE email_log ADD COLUMN message_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     
     # Activity log table
     cursor.execute("""
@@ -528,6 +535,7 @@ def get_email_logs():
         el["planId"] = el["plan_id"]
         el["planName"] = el["plan_name"]
         el["articlesCount"] = el["articles_count"]
+        el["messageId"] = el.get("message_id")
         logs.append(el)
     return logs
 
@@ -535,8 +543,8 @@ def save_email_log(el):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-    INSERT INTO email_log (id, plan_id, plan_name, ts, recipient, subject, articles_count, status, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO email_log (id, plan_id, plan_name, ts, recipient, subject, articles_count, status, error, message_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         el.get("id"),
         el.get("planId") or el.get("plan_id"),
@@ -546,7 +554,8 @@ def save_email_log(el):
         el.get("subject"),
         el.get("articlesCount") or el.get("articles_count", 0),
         el.get("status"),
-        el.get("error")
+        el.get("error"),
+        el.get("messageId") or el.get("message_id"),
     ))
     conn.commit()
     conn.close()
