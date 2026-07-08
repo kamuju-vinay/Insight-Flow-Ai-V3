@@ -2356,8 +2356,10 @@ class Scheduler {
       if (period === "week") {
         const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
         const targetDays = weekDays && weekDays.length > 0 ? weekDays : ["Mon", "Tue", "Wed", "Thu", "Fri"];
-        while (!targetDays.includes(dayNames[next.getDay()])) {
+        let guard = 0;
+        while (!targetDays.includes(dayNames[next.getDay()]) && guard < 400) {
           next.setDate(next.getDate() + 1);
+          guard++;
         }
       }
       // For monthly: advance to 1st of next month if needed
@@ -2422,8 +2424,10 @@ class Scheduler {
     if (period === "week") {
       const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
       const targetDays = weekDays && weekDays.length > 0 ? weekDays : ["Mon", "Tue", "Wed", "Thu", "Fri"];
-      while (!targetDays.includes(dayNames[nx.getDay()])) {
+      let guard = 0;
+      while (!targetDays.includes(dayNames[nx.getDay()]) && guard < 400) {
         nx.setDate(nx.getDate() + 1);
+        guard++;
       }
     }
     if (period === "month") { nx.setDate(1); if (nx <= n) { nx.setMonth(nx.getMonth() + 1); nx.setDate(1); } }
@@ -3914,7 +3918,16 @@ function nextRunLabel(freq,time,weekDays,monthDay,tz){
   const[hh,mm]=(time||"06:30").split(":").map(Number);
   const candidate=new Date(now.getFullYear(),now.getMonth(),now.getDate(),hh,mm);
   if(freq==="daily"){if(candidate<=now)candidate.setDate(candidate.getDate()+1);}
-  else if(freq==="weekly"){let d=candidate;const dayNames=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];while(!weekDays.includes(dayNames[d.getDay()])||d<=now)d.setDate(d.getDate()+1);return`${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}, ${fmtTime(time)}`;}
+  else if(freq==="weekly"){
+    let d=candidate;
+    const dayNames=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    // Guard against an empty (or corrupted) weekDays array — without this fallback
+    // and iteration cap, the while loop below never terminates and freezes the tab.
+    const targetDays=(weekDays&&weekDays.length>0)?weekDays:["Mon","Tue","Wed","Thu","Fri"];
+    let guard=0;
+    while((!targetDays.includes(dayNames[d.getDay()])||d<=now)&&guard<400){d.setDate(d.getDate()+1);guard++;}
+    return`${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}, ${fmtTime(time)}`;
+  }
   else if(freq==="monthly"){candidate.setDate(monthDay||1);if(candidate<=now)candidate.setMonth(candidate.getMonth()+1);}
   else return"Runs on interval";
   return`${candidate.getDate()} ${months[candidate.getMonth()]} ${candidate.getFullYear()}, ${fmtTime(time)}`;
@@ -3941,7 +3954,13 @@ function SchedTab({plan,dispatch,showToast,saveSchedule,runCrawl,crawling}){
   const setTz            = (v) => patch({schedTz:v});
   const setFetchPeriod   = (v) => patch({fetchPeriod:v});
   const setFetchPeriodDays = (v) => patch({fetchPeriodDays:Number(v)||1});
-  const togDay = (d) => patch({schedWeekDays: weekDays.includes(d) ? weekDays.filter(x=>x!==d) : [...weekDays,d]});
+  const togDay = (d) => {
+    if (weekDays.includes(d) && weekDays.length <= 1) {
+      showToast("At least one day must be selected", "warn");
+      return;
+    }
+    patch({schedWeekDays: weekDays.includes(d) ? weekDays.filter(x=>x!==d) : [...weekDays,d]});
+  };
   const renderTimeSelector = () => {
     const [hh, mm] = (time || "06:30").split(":");
     const h24 = parseInt(hh) || 6;
