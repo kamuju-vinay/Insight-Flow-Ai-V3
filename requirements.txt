@@ -9,3 +9,4 @@ lxml>=5.2.0
 pandas>=2.2.0
 python-dateutil>=2.9.0
 python-multipart>=0.0.9
+supabase>=2.3.0
