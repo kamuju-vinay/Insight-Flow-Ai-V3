@@ -5228,6 +5228,19 @@ function SettingsPage({store,dispatch,showToast}){
     });
     showToast("SMTP settings saved","success");
   };
+
+  // Auto-save SMTP settings shortly after any field stops changing, so the
+  // person doesn't have to click "Save SMTP Settings" manually. The manual
+  // button/toast above still works too (e.g. for an explicit confirmation).
+  const smtpAutoSaveFirstRun = useRef(true);
+  useEffect(()=>{
+    if (smtpAutoSaveFirstRun.current) { smtpAutoSaveFirstRun.current = false; return; }
+    const t = setTimeout(()=>{ saveSMTP(); }, 800);
+    return ()=>clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSmtp, outlookHost, outlookPort, outlookUser, outlookPass, outlookFrom, outlookName,
+      gmailHost, gmailPort, gmailUser, gmailPass, gmailFrom, gmailName]);
+
   const saveAutoEmail=()=>{dispatch({type:"UPD_CFG",changes:{auto_email:autoEmail,auto_email_time:autoEmailTime,auto_email_days:autoEmailDays}});showToast("Auto-mail schedule saved","success");};
 
   // ── Brevo test email ──
