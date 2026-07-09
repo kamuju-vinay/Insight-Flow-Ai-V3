@@ -1,320 +1,208 @@
 import os
-import sqlite3
 import json
 from datetime import datetime
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "..", "crawler.db")
-LEGACY_DB_FILE = os.path.join(os.path.dirname(__file__), "..", "db.json")
+from supabase import create_client, Client
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    return conn
+# =============================================================================
+# db.py - Supabase (Postgres) backed data layer
+#
+# Drop-in replacement for the old SQLite version. Every function name,
+# parameter list, and return shape (Python dicts with the SAME camelCase
+# keys the rest of the app already expects: recipientGroups, articlesCount,
+# pubDate, etc.) is kept identical, so main.py / crawler.py / email_service.py
+# do not need any changes.
+#
+# Under the hood, the Postgres columns use snake_case (Postgres best
+# practice / avoids case-folding surprises), and this file translates
+# between snake_case (DB) <-> camelCase (rest of the app) transparently.
+#
+# REQUIRED ENV VARS (set these in Railway / your host):
+#   SUPABASE_URL          - e.g. https://xxxxxxxx.supabase.co
+#   SUPABASE_SERVICE_KEY  - the "service_role" key from
+#                            Supabase > Project Settings > API
+#                            (server-side only, never expose to the frontend)
+#
+# REQUIRED ONE-TIME SETUP:
+#   Run the SQL in supabase_schema.sql (in the project root) once, in the
+#   Supabase SQL Editor, to create the tables. This file does NOT create
+#   tables itself (Supabase's REST API doesn't support DDL).
+# =============================================================================
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "Missing SUPABASE_URL / SUPABASE_SERVICE_KEY environment variables. "
+        "Set them in your host's environment (e.g. Railway Variables) before starting the app."
+    )
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# A value that can never collide with a real primary key, used as the
+# "match everything" filter PostgREST needs for bulk deletes.
+_NEVER_MATCH = "___never_matches___"
+
+
+# -----------------------------------------------------------------------
+# Field name maps: DB (snake_case) <-> app (camelCase)
+# -----------------------------------------------------------------------
+
+PLAN_JSON_FIELDS = {"urls", "recipientGroups", "periods", "triggerTimes", "crawlState", "schedWeekDays"}
+PLAN_BOOL_FIELDS = {"continuousRun", "searchBodyKeywords", "enableAIKeywords", "promptEnabled", "autoMail"}
+
+PLAN_DB_TO_PY = {
+    "id": "id", "name": "name", "icon": "icon", "bg": "bg", "status": "status", "stage": "stage",
+    "urls": "urls", "recipient_groups": "recipientGroups", "periods": "periods",
+    "trigger_times": "triggerTimes", "prompt": "prompt", "keywords": "keywords",
+    "articles_count": "articlesCount", "emails_count": "emailsCount", "last_run": "lastRun",
+    "created_at": "createdAt", "continuous_run": "continuousRun",
+    "relevance_threshold": "relevanceThreshold", "search_body_keywords": "searchBodyKeywords",
+    "enable_ai_keywords": "enableAIKeywords", "crawl_state": "crawlState",
+    "fetch_period": "fetchPeriod", "fetch_period_days": "fetchPeriodDays",
+    "prompt_enabled": "promptEnabled", "sched_freq": "schedFreq", "sched_time": "schedTime",
+    "sched_week_days": "schedWeekDays", "sched_month_day": "schedMonthDay",
+    "interval_minutes": "intervalMinutes", "sched_custom_unit": "schedCustomUnit",
+    "sched_tz": "schedTz", "auto_mail": "autoMail", "send_mode": "sendMode", "send_time": "sendTime",
+}
+PLAN_PY_TO_DB = {v: k for k, v in PLAN_DB_TO_PY.items()}
+
+ARTICLE_JSON_FIELDS = {"tags", "images", "videos", "attachments", "keywords", "metadata"}
+
+ARTICLE_DB_TO_PY = {
+    "id": "id", "plan_id": "plan_id", "url": "url", "title": "title", "subtitle": "subtitle",
+    "pub_date": "pubDate", "modified_date": "modifiedDate", "author": "author",
+    "category": "category", "tags": "tags", "summary": "summary", "content": "content",
+    "images": "images", "videos": "videos", "attachments": "attachments", "language": "language",
+    "keywords": "keywords", "canonical_url": "canonicalUrl", "meta_description": "metaDescription",
+    "metadata": "metadata", "created_at": "createdAt",
+}
+ARTICLE_PY_TO_DB = {v: k for k, v in ARTICLE_DB_TO_PY.items()}
+
+
+def _plan_row_to_py(row):
+    plan = {}
+    for db_key, py_key in PLAN_DB_TO_PY.items():
+        plan[py_key] = row.get(db_key)
+    for f in PLAN_JSON_FIELDS:
+        if plan.get(f) is None:
+            plan[f] = {} if f in ("triggerTimes", "crawlState") else []
+    for f in PLAN_BOOL_FIELDS:
+        plan[f] = bool(plan.get(f))
+    if row.get("prompt_enabled") is None:
+        plan["promptEnabled"] = True
+    return plan
+
+
+def _plan_py_to_row(plan):
+    row = {}
+    for py_key, db_key in PLAN_PY_TO_DB.items():
+        if py_key in plan:
+            row[db_key] = plan.get(py_key)
+    # Defaults / coercions matching old sqlite behavior
+    row["urls"] = plan.get("urls", [])
+    row["recipient_groups"] = plan.get("recipientGroups", [])
+    row["periods"] = plan.get("periods", [])
+    row["trigger_times"] = plan.get("triggerTimes", {})
+    row["crawl_state"] = plan.get("crawlState", {})
+    row["sched_week_days"] = plan.get("schedWeekDays", [])
+    row["articles_count"] = plan.get("articlesCount", 0)
+    row["emails_count"] = plan.get("emailsCount", 0)
+    row["stage"] = plan.get("stage", "idle")
+    row["continuous_run"] = bool(plan.get("continuousRun"))
+    row["relevance_threshold"] = plan.get("relevanceThreshold", 70)
+    row["search_body_keywords"] = bool(plan.get("searchBodyKeywords"))
+    row["enable_ai_keywords"] = bool(plan.get("enableAIKeywords", True))
+    row["fetch_period"] = plan.get("fetchPeriod", "week")
+    row["fetch_period_days"] = plan.get("fetchPeriodDays", 7)
+    row["prompt_enabled"] = bool(plan.get("promptEnabled", True))
+    row["auto_mail"] = bool(plan.get("autoMail"))
+    return row
+
+
+def _article_row_to_py(row):
+    art = {}
+    for db_key, py_key in ARTICLE_DB_TO_PY.items():
+        art[py_key] = row.get(db_key)
+    art["plan_id"] = row.get("plan_id")
+    art["planId"] = row.get("plan_id")
+    for f in ARTICLE_JSON_FIELDS:
+        if art.get(f) is None:
+            art[f] = {} if f == "metadata" else []
+    meta = art.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    art["metadata"] = meta
+    if isinstance(meta, dict):
+        for k, v in meta.items():
+            art.setdefault(k, v)
+    art["publish_date"] = art.get("pubDate", "")
+    return art
+
+
+def _article_py_to_row(art):
+    row = {}
+    for py_key, db_key in ARTICLE_PY_TO_DB.items():
+        row[db_key] = art.get(py_key)
+    row["plan_id"] = art.get("planId") or art.get("plan_id")
+    row["tags"] = art.get("tags", [])
+    row["images"] = art.get("images", [])
+    row["videos"] = art.get("videos", [])
+    row["attachments"] = art.get("attachments", [])
+    row["keywords"] = art.get("keywords", [])
+    row["metadata"] = art.get("metadata", {})
+    return row
+
+
+# -----------------------------------------------------------------------
+# init
+# -----------------------------------------------------------------------
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Settings table (key-value)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
-    
-    # Plans table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS plans (
-        id TEXT PRIMARY KEY,
-        name TEXT,
-        icon TEXT,
-        bg TEXT,
-        status TEXT,
-        stage TEXT,
-        urls TEXT,
-        recipientGroups TEXT,
-        periods TEXT,
-        triggerTimes TEXT,
-        prompt TEXT,
-        keywords TEXT,
-        articlesCount INTEGER DEFAULT 0,
-        emailsCount INTEGER DEFAULT 0,
-        lastRun TEXT,
-        createdAt TEXT,
-        continuousRun INTEGER DEFAULT 0,
-        relevanceThreshold INTEGER DEFAULT 70,
-        searchBodyKeywords INTEGER DEFAULT 0,
-        enableAIKeywords INTEGER DEFAULT 1,
-        crawlState TEXT,
-        fetchPeriod TEXT DEFAULT 'week',
-        fetchPeriodDays INTEGER DEFAULT 7,
-        promptEnabled INTEGER DEFAULT 1
-    )
-    """)
-
-    # Safe migration for DBs created before promptEnabled or schedule columns existed.
-    for col, col_type in [
-        ("promptEnabled", "INTEGER DEFAULT 1"),
-        ("schedFreq", "TEXT"),
-        ("schedTime", "TEXT"),
-        ("schedWeekDays", "TEXT"),
-        ("schedMonthDay", "INTEGER"),
-        ("intervalMinutes", "INTEGER"),
-        ("schedCustomUnit", "TEXT"),
-        ("schedTz", "TEXT"),
-        ("autoMail", "INTEGER DEFAULT 0"),
-        ("sendMode", "TEXT"),
-        ("sendTime", "TEXT")
-    ]:
-        try:
-            cursor.execute(f"ALTER TABLE plans ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-    # Articles table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS articles (
-        id TEXT PRIMARY KEY,
-        plan_id TEXT,
-        url TEXT,
-        title TEXT,
-        subtitle TEXT,
-        pubDate TEXT,
-        modifiedDate TEXT,
-        author TEXT,
-        category TEXT,
-        tags TEXT,
-        summary TEXT,
-        content TEXT,
-        images TEXT,
-        videos TEXT,
-        attachments TEXT,
-        language TEXT,
-        keywords TEXT,
-        canonicalUrl TEXT,
-        metaDescription TEXT,
-        metadata TEXT,
-        createdAt TEXT
-    )
-    """)
-    
-    # Email log table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS email_log (
-        id TEXT PRIMARY KEY,
-        plan_id TEXT,
-        plan_name TEXT,
-        ts TEXT,
-        recipient TEXT,
-        subject TEXT,
-        articles_count INTEGER,
-        status TEXT,
-        error TEXT,
-        message_id TEXT
-    )
-    """)
-    # Migration: add message_id to pre-existing email_log tables that were
-    # created before this column existed.
+    """
+    Tables live in Supabase/Postgres and are created once via
+    supabase_schema.sql in the Supabase SQL Editor (PostgREST has no DDL
+    endpoint). This just verifies connectivity on startup.
+    """
     try:
-        cursor.execute("ALTER TABLE email_log ADD COLUMN message_id TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    
-    # Activity log table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS activity_log (
-        id TEXT PRIMARY KEY,
-        ts TEXT,
-        event TEXT,
-        planName TEXT,
-        type TEXT
-    )
-    """)
-    
-    # Seen URLs table for deduplication / incremental crawl
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS seen_urls (
-        plan_id TEXT,
-        url TEXT,
-        crawled_at TEXT,
-        PRIMARY KEY (plan_id, url)
-    )
-    """)
-    
-    # Upgrade default concurrent workers from 4 to 20 to speed up crawling
-    cursor.execute("UPDATE settings SET value = '20' WHERE key = 'concurrent_workers' AND value = '4'")
-    
-    conn.commit()
-    
-    # Check if we should migrate legacy db.json
-    cursor.execute("SELECT COUNT(*) as cnt FROM plans")
-    has_plans = cursor.fetchone()["cnt"] > 0
-    
-    if not has_plans and os.path.exists(LEGACY_DB_FILE):
-        migrate_legacy_data(conn)
-        
-    conn.close()
-
-def migrate_legacy_data(conn):
-    print("🧹 Migrating legacy data from db.json...")
-    try:
-        with open(LEGACY_DB_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            
-        cursor = conn.cursor()
-        
-        # 1. Migrate settings
-        config = data.get("config", {})
-        # ensure new crawler fields are defined with defaults
-        config.setdefault("respect_robots_txt", "true")
-        config.setdefault("concurrent_workers", "20")
-        config.setdefault("timeout", "10")
-        config.setdefault("retry_count", "3")
-        config.setdefault("delay_between_requests", "1")
-        config.setdefault("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        config.setdefault("headers", "{}")
-        config.setdefault("proxy", "")
-        
-        for k, v in config.items():
-            val_str = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, val_str))
-            
-        # 2. Migrate plans
-        plans = data.get("plans", [])
-        for p in plans:
-            cursor.execute("""
-            INSERT OR REPLACE INTO plans (
-                id, name, icon, bg, status, stage, urls, recipientGroups, periods, triggerTimes,
-                prompt, keywords, articlesCount, emailsCount, lastRun, createdAt, continuousRun,
-                relevanceThreshold, searchBodyKeywords, enableAIKeywords, crawlState, fetchPeriod, fetchPeriodDays
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                p.get("id"),
-                p.get("name"),
-                p.get("icon"),
-                p.get("bg"),
-                p.get("status"),
-                p.get("stage", "idle"),
-                json.dumps(p.get("urls", [])),
-                json.dumps(p.get("recipientGroups", [])),
-                json.dumps(p.get("periods", [])),
-                json.dumps(p.get("triggerTimes", {})),
-                p.get("prompt"),
-                p.get("keywords"),
-                p.get("articlesCount", 0),
-                p.get("emailsCount", 0),
-                p.get("lastRun"),
-                p.get("createdAt"),
-                1 if p.get("continuousRun") else 0,
-                p.get("relevanceThreshold", 70),
-                1 if p.get("searchBodyKeywords") else 0,
-                1 if p.get("enableAIKeywords") else 0,
-                json.dumps(p.get("crawlState", {})),
-                p.get("fetchPeriod", "week"),
-                p.get("fetchPeriodDays", 7)
-            ))
-            
-        # 3. Migrate articles
-        articles = data.get("articles", [])
-        for a in articles:
-            cursor.execute("""
-            INSERT OR REPLACE INTO articles (
-                id, plan_id, url, title, subtitle, pubDate, modifiedDate, author, category,
-                tags, summary, content, images, videos, attachments, language, keywords,
-                canonicalUrl, metaDescription, metadata, createdAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                a.get("id"),
-                a.get("plan_id") or a.get("planId"),
-                a.get("url"),
-                a.get("title"),
-                a.get("subtitle"),
-                a.get("pubDate"),
-                a.get("modifiedDate"),
-                a.get("author"),
-                a.get("category"),
-                json.dumps(a.get("tags", [])),
-                a.get("summary"),
-                a.get("content"),
-                json.dumps(a.get("images", [])),
-                json.dumps(a.get("videos", [])),
-                json.dumps(a.get("attachments", [])),
-                a.get("language"),
-                json.dumps(a.get("keywords", [])),
-                a.get("canonicalUrl"),
-                a.get("metaDescription"),
-                json.dumps(a.get("metadata", {})),
-                a.get("createdAt")
-            ))
-            
-        # 4. Migrate emailLog
-        email_log = data.get("emailLog", [])
-        for el in email_log:
-            cursor.execute("""
-            INSERT OR REPLACE INTO email_log (
-                id, plan_id, plan_name, ts, recipient, subject, articles_count, status, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                el.get("id"),
-                el.get("plan_id") or el.get("planId"),
-                el.get("plan_name") or el.get("planName"),
-                el.get("ts"),
-                el.get("recipient"),
-                el.get("subject"),
-                el.get("articles_count") or el.get("articlesCount", 0),
-                el.get("status"),
-                el.get("error")
-            ))
-            
-        # 5. Migrate activityLog
-        activity_log = data.get("activityLog", [])
-        for al in activity_log:
-            cursor.execute("""
-            INSERT OR REPLACE INTO activity_log (id, ts, event, planName, type)
-            VALUES (?, ?, ?, ?, ?)
-            """, (
-                al.get("id"),
-                al.get("ts"),
-                al.get("event"),
-                al.get("planName"),
-                al.get("type")
-            ))
-            
-        conn.commit()
-        print("✅ Migration complete!")
+        supabase.table("settings").select("key").limit(1).execute()
+        print("✅ Connected to Supabase.")
     except Exception as e:
-        print(f"❌ Error migrating legacy database: {e}")
-        conn.rollback()
+        print(f"❌ Could not reach Supabase tables. Did you run supabase_schema.sql? Error: {e}")
+        raise
+
+
+# -----------------------------------------------------------------------
+# settings
+# -----------------------------------------------------------------------
 
 def get_settings():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT key, value FROM settings")
-    rows = cursor.fetchall()
-    conn.close()
-    
+    res = supabase.table("settings").select("key, value").execute()
+    rows = res.data or []
     settings = {}
     for r in rows:
         val = r["value"]
-        # try to parse as JSON
         try:
             settings[r["key"]] = json.loads(val)
-        except:
-            if val.lower() == "true":
+        except Exception:
+            if isinstance(val, str) and val.lower() == "true":
                 settings[r["key"]] = True
-            elif val.lower() == "false":
+            elif isinstance(val, str) and val.lower() == "false":
                 settings[r["key"]] = False
             else:
                 try:
                     settings[r["key"]] = int(val)
-                except ValueError:
+                except (ValueError, TypeError):
                     settings[r["key"]] = val
     return settings
 
+
 def save_settings(cfg):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    rows = []
     for k, v in cfg.items():
         if isinstance(v, (dict, list)):
             val_str = json.dumps(v)
@@ -322,304 +210,188 @@ def save_settings(cfg):
             val_str = "true" if v else "false"
         else:
             val_str = str(v)
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, val_str))
-    conn.commit()
-    conn.close()
+        rows.append({"key": k, "value": val_str})
+    if rows:
+        supabase.table("settings").upsert(rows, on_conflict="key").execute()
+
+
+# -----------------------------------------------------------------------
+# plans
+# -----------------------------------------------------------------------
 
 def get_plans():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM plans")
-    rows = cursor.fetchall()
-    conn.close()
-    
-    plans = []
-    for r in rows:
-        plan = dict(r)
-        plan["urls"] = json.loads(plan["urls"] or "[]")
-        plan["recipientGroups"] = json.loads(plan["recipientGroups"] or "[]")
-        plan["periods"] = json.loads(plan["periods"] or "[]")
-        plan["triggerTimes"] = json.loads(plan["triggerTimes"] or "{}")
-        plan["crawlState"] = json.loads(plan["crawlState"] or "{}")
-        plan["schedWeekDays"] = json.loads(plan.get("schedWeekDays") or "[]")
-        plan["autoMail"] = bool(plan.get("autoMail", 0))
-        plan["continuousRun"] = bool(plan["continuousRun"])
-        plan["searchBodyKeywords"] = bool(plan["searchBodyKeywords"])
-        plan["enableAIKeywords"] = bool(plan["enableAIKeywords"])
-        plan["promptEnabled"] = bool(plan["promptEnabled"]) if plan.get("promptEnabled") is not None else True
-        plans.append(plan)
-    return plans
+    res = supabase.table("plans").select("*").execute()
+    return [_plan_row_to_py(r) for r in (res.data or [])]
+
 
 def get_plan(plan_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM plans WHERE id = ?", (plan_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
+    res = supabase.table("plans").select("*").eq("id", plan_id).limit(1).execute()
+    rows = res.data or []
+    if not rows:
         return None
-    plan = dict(row)
-    plan["urls"] = json.loads(plan["urls"] or "[]")
-    plan["recipientGroups"] = json.loads(plan["recipientGroups"] or "[]")
-    plan["periods"] = json.loads(plan["periods"] or "[]")
-    plan["triggerTimes"] = json.loads(plan["triggerTimes"] or "{}")
-    plan["crawlState"] = json.loads(plan["crawlState"] or "{}")
-    plan["schedWeekDays"] = json.loads(plan.get("schedWeekDays") or "[]")
-    plan["autoMail"] = bool(plan.get("autoMail", 0))
-    plan["continuousRun"] = bool(plan["continuousRun"])
-    plan["searchBodyKeywords"] = bool(plan["searchBodyKeywords"])
-    plan["enableAIKeywords"] = bool(plan["enableAIKeywords"])
-    plan["promptEnabled"] = bool(plan["promptEnabled"]) if plan.get("promptEnabled") is not None else True
-    return plan
+    return _plan_row_to_py(rows[0])
+
 
 def save_plan(plan):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT OR REPLACE INTO plans (
-        id, name, icon, bg, status, stage, urls, recipientGroups, periods, triggerTimes,
-        prompt, keywords, articlesCount, emailsCount, lastRun, createdAt, continuousRun,
-        relevanceThreshold, searchBodyKeywords, enableAIKeywords, crawlState, fetchPeriod, fetchPeriodDays,
-        promptEnabled, schedFreq, schedTime, schedWeekDays, schedMonthDay, intervalMinutes, schedCustomUnit,
-        schedTz, autoMail, sendMode, sendTime
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        plan.get("id"),
-        plan.get("name"),
-        plan.get("icon"),
-        plan.get("bg"),
-        plan.get("status"),
-        plan.get("stage", "idle"),
-        json.dumps(plan.get("urls", [])),
-        json.dumps(plan.get("recipientGroups", [])),
-        json.dumps(plan.get("periods", [])),
-        json.dumps(plan.get("triggerTimes", {})),
-        plan.get("prompt"),
-        plan.get("keywords"),
-        plan.get("articlesCount", 0),
-        plan.get("emailsCount", 0),
-        plan.get("lastRun"),
-        plan.get("createdAt"),
-        1 if plan.get("continuousRun") else 0,
-        plan.get("relevanceThreshold", 70),
-        1 if plan.get("searchBodyKeywords") else 0,
-        1 if plan.get("enableAIKeywords") else 0,
-        json.dumps(plan.get("crawlState", {})),
-        plan.get("fetchPeriod", "week"),
-        plan.get("fetchPeriodDays", 7),
-        1 if plan.get("promptEnabled", True) else 0,
-        plan.get("schedFreq"),
-        plan.get("schedTime"),
-        json.dumps(plan.get("schedWeekDays", [])),
-        plan.get("schedMonthDay"),
-        plan.get("intervalMinutes"),
-        plan.get("schedCustomUnit"),
-        plan.get("schedTz"),
-        1 if plan.get("autoMail") else 0,
-        plan.get("sendMode"),
-        plan.get("sendTime")
-    ))
-    conn.commit()
-    conn.close()
+    row = _plan_py_to_row(plan)
+    supabase.table("plans").upsert(row, on_conflict="id").execute()
+
 
 def delete_plan(plan_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
-    cursor.execute("DELETE FROM articles WHERE plan_id = ?", (plan_id,))
-    cursor.execute("DELETE FROM seen_urls WHERE plan_id = ?", (plan_id,))
-    conn.commit()
-    conn.close()
+    supabase.table("plans").delete().eq("id", plan_id).execute()
+    supabase.table("articles").delete().eq("plan_id", plan_id).execute()
+    supabase.table("seen_urls").delete().eq("plan_id", plan_id).execute()
+
+
+# -----------------------------------------------------------------------
+# articles
+# -----------------------------------------------------------------------
 
 def get_articles(plan_id=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    q = supabase.table("articles").select("*")
     if plan_id:
-        cursor.execute("SELECT * FROM articles WHERE plan_id = ? ORDER BY pubDate DESC", (plan_id,))
-    else:
-        cursor.execute("SELECT * FROM articles ORDER BY pubDate DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    
-    articles = []
-    for r in rows:
-        art = dict(r)
-        art["planId"] = art["plan_id"]
-        art["tags"] = json.loads(art["tags"] or "[]")
-        art["images"] = json.loads(art["images"] or "[]")
-        art["videos"] = json.loads(art["videos"] or "[]")
-        art["attachments"] = json.loads(art["attachments"] or "[]")
-        art["keywords"] = json.loads(art["keywords"] or "[]")
-        meta = json.loads(art["metadata"] or "{}")
-        art["metadata"] = meta
-        if isinstance(meta, dict):
-            for k, v in meta.items():
-                art.setdefault(k, v)
-        # Rename pubDate to publish_date for frontend compatibility
-        art["publish_date"] = art.get("pubDate", "")
-        articles.append(art)
-    return articles
+        q = q.eq("plan_id", plan_id)
+    res = q.order("pub_date", desc=True).execute()
+    return [_article_row_to_py(r) for r in (res.data or [])]
+
 
 def save_article(art):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
     plan_id = art.get("planId") or art.get("plan_id")
-    
-    cursor.execute("""
-    INSERT OR REPLACE INTO articles (
-        id, plan_id, url, title, subtitle, pubDate, modifiedDate, author, category,
-        tags, summary, content, images, videos, attachments, language, keywords,
-        canonicalUrl, metaDescription, metadata, createdAt
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        art.get("id"),
-        plan_id,
-        art.get("url"),
-        art.get("title"),
-        art.get("subtitle"),
-        art.get("pubDate"),
-        art.get("modifiedDate"),
-        art.get("author"),
-        art.get("category"),
-        json.dumps(art.get("tags", [])),
-        art.get("summary"),
-        art.get("content"),
-        json.dumps(art.get("images", [])),
-        json.dumps(art.get("videos", [])),
-        json.dumps(art.get("attachments", [])),
-        art.get("language"),
-        json.dumps(art.get("keywords", [])),
-        art.get("canonicalUrl"),
-        art.get("metaDescription"),
-        json.dumps(art.get("metadata", {})),
-        art.get("createdAt")
-    ))
-    cursor.execute("UPDATE plans SET articlesCount = (SELECT COUNT(*) FROM articles WHERE plan_id = ?) WHERE id = ?", (plan_id, plan_id))
-    conn.commit()
-    conn.close()
+    row = _article_py_to_row(art)
+    supabase.table("articles").upsert(row, on_conflict="id").execute()
+
+    count_res = (
+        supabase.table("articles")
+        .select("id", count="exact")
+        .eq("plan_id", plan_id)
+        .execute()
+    )
+    count = count_res.count or 0
+    supabase.table("plans").update({"articles_count": count}).eq("id", plan_id).execute()
+
 
 def delete_articles(plan_id=None, article_id=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
     if plan_id:
-        cursor.execute("DELETE FROM articles WHERE plan_id = ?", (plan_id,))
-        cursor.execute("DELETE FROM seen_urls WHERE plan_id = ?", (plan_id,))
-        cursor.execute("UPDATE plans SET articlesCount = 0 WHERE id = ?", (plan_id,))
+        supabase.table("articles").delete().eq("plan_id", plan_id).execute()
+        supabase.table("seen_urls").delete().eq("plan_id", plan_id).execute()
+        supabase.table("plans").update({"articles_count": 0}).eq("id", plan_id).execute()
     elif article_id:
-        cursor.execute("SELECT plan_id, url FROM articles WHERE id = ?", (article_id,))
-        row = cursor.fetchone()
-        if row:
-            p_id = row["plan_id"]
-            url = row["url"]
-            cursor.execute("DELETE FROM articles WHERE id = ?", (article_id,))
-            cursor.execute("DELETE FROM seen_urls WHERE plan_id = ? AND url = ?", (p_id, url))
-            cursor.execute("UPDATE plans SET articlesCount = (SELECT COUNT(*) FROM articles WHERE plan_id = ?) WHERE id = ?", (p_id, p_id))
+        res = supabase.table("articles").select("plan_id, url").eq("id", article_id).limit(1).execute()
+        rows = res.data or []
+        if rows:
+            p_id = rows[0]["plan_id"]
+            url = rows[0]["url"]
+            supabase.table("articles").delete().eq("id", article_id).execute()
+            supabase.table("seen_urls").delete().eq("plan_id", p_id).eq("url", url).execute()
+            count_res = (
+                supabase.table("articles")
+                .select("id", count="exact")
+                .eq("plan_id", p_id)
+                .execute()
+            )
+            supabase.table("plans").update({"articles_count": count_res.count or 0}).eq("id", p_id).execute()
     else:
-        cursor.execute("DELETE FROM articles")
-        cursor.execute("DELETE FROM seen_urls")
-        cursor.execute("UPDATE plans SET articlesCount = 0")
-    conn.commit()
-    conn.close()
+        supabase.table("articles").delete().neq("id", _NEVER_MATCH).execute()
+        supabase.table("seen_urls").delete().neq("plan_id", _NEVER_MATCH).execute()
+        supabase.table("plans").update({"articles_count": 0}).neq("id", _NEVER_MATCH).execute()
+
+
+# -----------------------------------------------------------------------
+# email log
+# -----------------------------------------------------------------------
 
 def get_email_logs():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM email_log ORDER BY ts DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    
+    res = supabase.table("email_log").select("*").order("ts", desc=True).execute()
     logs = []
-    for r in rows:
+    for r in (res.data or []):
         el = dict(r)
-        el["planId"] = el["plan_id"]
-        el["planName"] = el["plan_name"]
-        el["articlesCount"] = el["articles_count"]
+        el["planId"] = el.get("plan_id")
+        el["planName"] = el.get("plan_name")
+        el["articlesCount"] = el.get("articles_count")
         el["messageId"] = el.get("message_id")
         logs.append(el)
     return logs
 
+
 def save_email_log(el):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO email_log (id, plan_id, plan_name, ts, recipient, subject, articles_count, status, error, message_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        el.get("id"),
-        el.get("planId") or el.get("plan_id"),
-        el.get("planName") or el.get("plan_name"),
-        el.get("ts"),
-        el.get("recipient"),
-        el.get("subject"),
-        el.get("articlesCount") or el.get("articles_count", 0),
-        el.get("status"),
-        el.get("error"),
-        el.get("messageId") or el.get("message_id"),
-    ))
-    conn.commit()
-    conn.close()
+    row = {
+        "id": el.get("id"),
+        "plan_id": el.get("planId") or el.get("plan_id"),
+        "plan_name": el.get("planName") or el.get("plan_name"),
+        "ts": el.get("ts"),
+        "recipient": el.get("recipient"),
+        "subject": el.get("subject"),
+        "articles_count": el.get("articlesCount") or el.get("articles_count", 0),
+        "status": el.get("status"),
+        "error": el.get("error"),
+        "message_id": el.get("messageId") or el.get("message_id"),
+    }
+    supabase.table("email_log").insert(row).execute()
+
+
+# -----------------------------------------------------------------------
+# activity log
+# -----------------------------------------------------------------------
 
 def get_logs():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM activity_log ORDER BY ts DESC LIMIT 1000")
-    rows = cursor.fetchall()
-    conn.close()
-    res = []
-    for r in rows:
+    res = supabase.table("activity_log").select("*").order("ts", desc=True).limit(1000).execute()
+    out = []
+    for r in (res.data or []):
         d = dict(r)
-        d["plan"] = d.get("planName", "")
-        res.append(d)
-    return res
+        d["planName"] = d.get("plan_name")
+        d["plan"] = d.get("plan_name", "")
+        out.append(d)
+    return out
+
 
 def save_log(event, plan_name="", log_type="info"):
-    conn = get_db_connection()
-    cursor = conn.cursor()
     log_id = f"log_{int(datetime.utcnow().timestamp() * 1000)}"
-    cursor.execute("""
-    INSERT INTO activity_log (id, ts, event, planName, type)
-    VALUES (?, ?, ?, ?, ?)
-    """, (
-        log_id,
-        datetime.utcnow().isoformat() + "Z",
-        event,
-        plan_name,
-        log_type
-    ))
-    conn.commit()
-    conn.close()
+    row = {
+        "id": log_id,
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "event": event,
+        "plan_name": plan_name,
+        "type": log_type,
+    }
+    supabase.table("activity_log").insert(row).execute()
 
-def clear_all_data():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM plans")
-    cursor.execute("DELETE FROM articles")
-    cursor.execute("DELETE FROM email_log")
-    cursor.execute("DELETE FROM activity_log")
-    cursor.execute("DELETE FROM seen_urls")
-    conn.commit()
-    conn.close()
 
 def clear_activity_logs():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM activity_log")
-    conn.commit()
-    conn.close()
+    supabase.table("activity_log").delete().neq("id", _NEVER_MATCH).execute()
+
+
+# -----------------------------------------------------------------------
+# bulk clear
+# -----------------------------------------------------------------------
+
+def clear_all_data():
+    supabase.table("plans").delete().neq("id", _NEVER_MATCH).execute()
+    supabase.table("articles").delete().neq("id", _NEVER_MATCH).execute()
+    supabase.table("email_log").delete().neq("id", _NEVER_MATCH).execute()
+    supabase.table("activity_log").delete().neq("id", _NEVER_MATCH).execute()
+    supabase.table("seen_urls").delete().neq("plan_id", _NEVER_MATCH).execute()
+
+
+# -----------------------------------------------------------------------
+# seen urls (dedupe / incremental crawl)
+# -----------------------------------------------------------------------
 
 def is_seen_url(plan_id, url):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM seen_urls WHERE plan_id = ? AND url = ?", (plan_id, url))
-    seen = cursor.fetchone() is not None
-    conn.close()
-    return seen
+    res = (
+        supabase.table("seen_urls")
+        .select("plan_id")
+        .eq("plan_id", plan_id)
+        .eq("url", url)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
 
 def add_seen_url(plan_id, url):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO seen_urls (plan_id, url, crawled_at) VALUES (?, ?, ?)",
-                   (plan_id, url, datetime.utcnow().isoformat() + "Z"))
-    conn.commit()
-    conn.close()
+    row = {
+        "plan_id": plan_id,
+        "url": url,
+        "crawled_at": datetime.utcnow().isoformat() + "Z",
+    }
+    supabase.table("seen_urls").upsert(row, on_conflict="plan_id,url").execute()
