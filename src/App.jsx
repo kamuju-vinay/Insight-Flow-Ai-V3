@@ -3995,9 +3995,20 @@ function SchedTab({plan,dispatch,showToast,saveSchedule,runCrawl,crawling}){
   const isPaused = plan.status!=="running";
 
   const handleSave = () => {
+    // For "custom" frequency, compute total minutes (matching the client
+    // scheduler's own conversion) and encode it as e.g. "45m" so the backend
+    // scheduler (which parses digits out of the period string) can actually
+    // register a real IntervalTrigger job — previously this saved the literal
+    // string "hour" here, which the backend couldn't parse into any interval,
+    // so Custom-frequency plans never got a server-side scheduled job at all.
+    const customMinutes = customUnit === "hours" ? Number(customVal) * 60
+                         : customUnit === "days"  ? Number(customVal) * 1440
+                         : Number(customVal);
+    const customPeriod = `${Math.max(1, customMinutes || 30)}m`;
+
     saveSchedule(
-      freq==="daily"?["day"]:freq==="weekly"?["week"]:freq==="monthly"?["month"]:["hour"],
-      {day:time,week:time,month:time,hour:time},
+      freq==="daily"?["day"]:freq==="weekly"?["week"]:freq==="monthly"?["month"]:[customPeriod],
+      {day:time,week:time,month:time,[customPeriod]:time},
       {schedFreq:freq,schedTime:time,schedWeekDays:weekDays,schedMonthDay:monthDay,
        intervalMinutes:Number(customVal)||30,schedCustomUnit:customUnit,schedTz:tz,
        fetchPeriod,fetchPeriodDays:Number(fetchPeriodDays)||7}
