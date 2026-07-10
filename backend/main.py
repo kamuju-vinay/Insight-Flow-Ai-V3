@@ -8,9 +8,11 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 
-# Override stdout and stderr encoding to support emojis on Windows
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+# Override stdout and stderr encoding to support emojis on Windows, and force
+# line-buffering so print() output reaches Railway's log collector immediately
+# instead of sitting in an internal buffer.
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True, write_through=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True, write_through=True)
 
 
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query
@@ -26,8 +28,10 @@ import io
 from backend.db import (
     init_db, get_settings, save_settings, get_plans, get_plan, save_plan, delete_plan,
     get_articles, save_article, delete_articles, get_email_logs, save_email_log, get_logs,
-    save_log, clear_all_data, is_seen_url
+    save_log, clear_all_data, is_seen_url,
+    count_users, get_user_by_email, get_user_by_id, create_user, claim_orphan_data,
 )
+from backend.auth import hash_password, verify_password, create_token, get_current_user_id
 from backend.crawler import run_crawl_backend, fetch_url_html, is_allowed_by_robots
 from backend.scheduler import start_scheduler, stop_scheduler, register_plan_job, remove_plan_job
 from backend.email_service import send_html_email, send_notification, get_brevo_config
@@ -106,49 +110,96 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 # ── Auth Endpoints ───────────────────────────────────────
-@app.post("/api/auth/login")
-def login(payload: dict):
-    email = payload.get("email", "user@example.com")
-    return {"token": "mock-jwt-token", "user": {"email": email}}
+# NOTE: login/signup intentionally return normal 200 responses with an
+# "error" field on failure (never a 401) — the frontend's apiFetch treats
+# any 401 as "your session expired" and force-reloads to the login screen,
+# which would make a wrong password look like a broken app instead of a
+# clear "wrong password" message.
 
 @app.post("/api/auth/signup")
 def signup(payload: dict):
-    email = payload.get("email", "user@example.com")
-    return {"token": "mock-jwt-token", "user": {"email": email}}
+    email = (payload.get("email") or "").strip().lower()
+    password = payload.get("password") or ""
+    if not email or "@" not in email:
+        return {"error": "Enter a valid email address."}
+    if len(password) < 8:
+        return {"error": "Password must be at least 8 characters."}
+    if get_user_by_email(email):
+        return {"error": "An account with that email already exists."}
+
+    is_first_user = count_users() == 0
+    user = create_user(email, hash_password(password))
+    if is_first_user:
+        # One-time convenience: claim any plans/articles/logs that existed
+        # before accounts existed, so nothing appears to "disappear".
+        try:
+            claim_orphan_data(user["id"])
+        except Exception as e:
+            print(f"⚠️ Could not claim orphaned data for first user: {e}")
+
+    token = create_token(user["id"], user["email"])
+    return {"token": token, "user": {"id": user["id"], "email": user["email"]}}
+
+
+@app.post("/api/auth/login")
+def login(payload: dict):
+    email = (payload.get("email") or "").strip().lower()
+    password = payload.get("password") or ""
+    user = get_user_by_email(email)
+    if not user or not verify_password(password, user["password_hash"]):
+        return {"error": "Incorrect email or password."}
+
+    token = create_token(user["id"], user["email"])
+    return {"token": token, "user": {"id": user["id"], "email": user["email"]}}
+
 
 @app.get("/api/auth/me")
-def get_me():
-    return {"user": {"email": "user@example.com"}}
+def get_me(user_id: str = Depends(get_current_user_id)):
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return {"user": {"id": user["id"], "email": user["email"]}}
 
 # ── Settings Endpoints ───────────────────────────────────
+# Settings (SMTP, AI keys, crawler config) stay shared team-wide by design —
+# only plans/articles are private per-user. But they must require login,
+# since they contain secrets (SMTP password, AI API keys).
 @app.get("/api/settings")
-def get_api_settings():
+def get_api_settings(user_id: str = Depends(get_current_user_id)):
     return get_settings()
 
 @app.put("/api/settings")
-def update_api_settings(payload: dict):
+def update_api_settings(payload: dict, user_id: str = Depends(get_current_user_id)):
     save_settings(payload)
     return get_settings()
 
 # ── Plans Endpoints ──────────────────────────────────────
 @app.get("/api/plans")
-def get_api_plans():
-    return get_plans()
+def get_api_plans(user_id: str = Depends(get_current_user_id)):
+    return get_plans(user_id=user_id)
 
 @app.post("/api/plans")
-def create_api_plan(payload: dict):
+def create_api_plan(payload: dict, user_id: str = Depends(get_current_user_id)):
+    payload["user_id"] = user_id
     save_plan(payload)
     register_plan_job(payload)
     return payload
 
 @app.put("/api/plans/{plan_id}")
-def update_api_plan(plan_id: str, payload: dict):
+def update_api_plan(plan_id: str, payload: dict, user_id: str = Depends(get_current_user_id)):
+    existing = get_plan(plan_id)
+    if not existing or existing.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    payload["user_id"] = user_id
     save_plan(payload)
     register_plan_job(payload)
     return payload
 
 @app.delete("/api/plans/{plan_id}")
-def delete_api_plan(plan_id: str):
+def delete_api_plan(plan_id: str, user_id: str = Depends(get_current_user_id)):
+    existing = get_plan(plan_id)
+    if not existing or existing.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Plan not found")
     remove_plan_job(plan_id)
     delete_plan(plan_id)
     return {"success": True}
@@ -165,56 +216,71 @@ def run_crawl_task(plan_id: str):
             plan["status"] = "running"
             plan["stage"] = "done"
             save_plan(plan)
-            save_log(event=f"Crawl failed: {str(e)}", plan_name=plan.get("name", plan_id), log_type="error")
+            save_log(event=f"Crawl failed: {str(e)}", plan_name=plan.get("name", plan_id), log_type="error", plan_id=plan_id)
 
 @app.post("/api/plans/{plan_id}/run")
-def run_api_plan(plan_id: str, background_tasks: BackgroundTasks):
+def run_api_plan(plan_id: str, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user_id)):
     plan = get_plan(plan_id)
-    if not plan:
+    if not plan or plan.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Plan not found")
-        
+
     if plan.get("stage") in ["crawling", "analyzing", "summarizing", "sending"]:
         return {"error": "Crawl already running for this plan"}
-        
+
     background_tasks.add_task(run_crawl_task, plan_id)
     return {"success": True}
 
 # ── Articles Endpoints ───────────────────────────────────
 @app.get("/api/articles")
-def get_api_articles(planId: Optional[str] = None):
-    return get_articles(planId)
+def get_api_articles(planId: Optional[str] = None, user_id: str = Depends(get_current_user_id)):
+    if planId:
+        plan = get_plan(planId)
+        if not plan or plan.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Plan not found")
+    return get_articles(planId, user_id=user_id)
 
 @app.post("/api/articles")
-def create_api_article(payload: dict):
+def create_api_article(payload: dict, user_id: str = Depends(get_current_user_id)):
+    plan_id = payload.get("planId") or payload.get("plan_id")
+    if plan_id:
+        plan = get_plan(plan_id)
+        if not plan or plan.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Plan not found")
+    payload["user_id"] = user_id
     save_article(payload)
     return payload
 
 @app.delete("/api/articles")
-def delete_api_articles(planId: Optional[str] = None, id: Optional[str] = None):
+def delete_api_articles(planId: Optional[str] = None, id: Optional[str] = None, user_id: str = Depends(get_current_user_id)):
+    if planId:
+        plan = get_plan(planId)
+        if not plan or plan.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Plan not found")
     delete_articles(planId, id)
     return {"success": True}
 
 # ── Logs & Email Logs Endpoints ─────────────────────────
 @app.get("/api/email-log")
-def get_api_email_logs():
-    return get_email_logs()
+def get_api_email_logs(user_id: str = Depends(get_current_user_id)):
+    return get_email_logs(user_id=user_id)
 
 @app.get("/api/logs")
-def get_api_logs():
-    return get_logs()
+def get_api_logs(user_id: str = Depends(get_current_user_id)):
+    return get_logs(user_id=user_id)
 
 @app.post("/api/logs")
-def create_api_log(payload: dict):
+def create_api_log(payload: dict, user_id: str = Depends(get_current_user_id)):
     save_log(
         payload.get("event", ""),
         payload.get("planName", ""),
-        payload.get("type", "info")
+        payload.get("type", "info"),
+        user_id=user_id,
     )
     return {"success": True}
 
 # ── Mail Sender (Brevo REST API only — SMTP/Resend are not used) ──────────
 @app.post("/api/send-email")
-def send_email_endpoint(payload: dict):
+def send_email_endpoint(payload: dict, user_id: str = Depends(get_current_user_id)):
     """General-purpose send used by the frontend's manual "Send Now" flow
     and by the standalone email test page. Supports cc/bcc/attachments so
     it doubles as the endpoint behind the Settings → Test Email UI."""
@@ -225,6 +291,11 @@ def send_email_endpoint(payload: dict):
 
     if not all([to, subject, html]):
         raise HTTPException(status_code=400, detail="Missing recipient, subject, or email content.")
+
+    if plan_id:
+        plan = get_plan(plan_id)
+        if not plan or plan.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Plan not found")
 
     result = send_html_email(
         to, subject, html,
@@ -254,7 +325,7 @@ def email_config_status():
 
 
 @app.post("/api/test-email")
-def test_email_endpoint(payload: dict = None):
+def test_email_endpoint(payload: dict = None, user_id: str = Depends(get_current_user_id)):
     """Sends a sample email to verify the Brevo integration end-to-end.
     Body: { "to": "someone@example.com" } — subject/body are fixed so this
     stays a pure connectivity/deliverability check."""
@@ -472,8 +543,12 @@ def fetch_url(url: str = Query(...)):
 
 # ── Export Endpoint ──────────────────────────────────────
 @app.get("/api/export")
-def export_articles(planId: Optional[str] = None, format: str = Query("csv")):
-    articles = get_articles(planId)
+def export_articles(planId: Optional[str] = None, format: str = Query("csv"), user_id: str = Depends(get_current_user_id)):
+    if planId:
+        plan = get_plan(planId)
+        if not plan or plan.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Plan not found")
+    articles = get_articles(planId, user_id=user_id)
     if not articles:
         raise HTTPException(status_code=404, detail="No articles found to export")
 
@@ -509,15 +584,15 @@ def export_articles(planId: Optional[str] = None, format: str = Query("csv")):
 
 # ── Clear All Data ───────────────────────────────────────
 @app.delete("/api/data")
-def clear_data():
-    clear_all_data()
+def clear_data(user_id: str = Depends(get_current_user_id)):
+    clear_all_data(user_id=user_id)
     return {"success": True}
 
 # ── Clear Activity Logs ──────────────────────────────────
 @app.delete("/api/logs")
-def clear_api_logs():
+def clear_api_logs(user_id: str = Depends(get_current_user_id)):
     from backend.db import clear_activity_logs
-    clear_activity_logs()
+    clear_activity_logs(user_id=user_id)
     return {"success": True}
 
 # ── Mount static SPA React frontend ──────────────────────
