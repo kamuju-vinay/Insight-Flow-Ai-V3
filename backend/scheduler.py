@@ -19,18 +19,18 @@ def email_job_wrapper(plan_id):
 
     articles = get_articles(plan_id)
     if not articles:
-        save_log(f"⚠️ Scheduled email skipped for plan \"{plan['name']}\": no articles yet.", plan["name"], "warn")
+        save_log(f"⚠️ Scheduled email skipped for plan \"{plan['name']}\": no articles yet.", plan["name"], "warn", user_id=plan.get("user_id"))
         return
 
-    save_log(f"📧 Scheduler triggered email send for plan: {plan['name']}", plan["name"], "email")
+    save_log(f"📧 Scheduler triggered email send for plan: {plan['name']}", plan["name"], "email", user_id=plan.get("user_id"))
     try:
         result = send_digest_for_plan(plan, articles)
         save_log(
             f"✅ Scheduled email complete: {result['sent']} sent, {result['failed']} failed.",
-            plan["name"], "email"
+            plan["name"], "email", user_id=plan.get("user_id")
         )
     except Exception as e:
-        save_log(f"❌ Scheduled email failed: {e}", plan["name"], "error")
+        save_log(f"❌ Scheduled email failed: {e}", plan["name"], "error", user_id=plan.get("user_id"))
 
 def job_wrapper(plan_id):
     from backend.db import get_settings, save_log, get_plan
@@ -40,20 +40,22 @@ def job_wrapper(plan_id):
     if not plan:
         return
         
-    save_log(f"⏰ Scheduler triggered background crawl for plan: {plan['name']}", plan["name"], "info")
+    save_log(f"⏰ Scheduler triggered background crawl for plan: {plan['name']}", plan["name"], "info", user_id=plan.get("user_id"))
     config = get_settings()
     
     try:
         run_crawl_backend(plan_id)
     except Exception as e:
-        save_log(f"❌ Scheduled crawl failed: {e}", plan["name"], "error")
+        save_log(f"❌ Scheduled crawl failed: {e}", plan["name"], "error", user_id=plan.get("user_id"))
 
 def register_plan_job(plan):
     remove_plan_job(plan["id"])
     
     if plan.get("status") != "running":
         return
-        
+
+    from backend.db import save_log
+    registered_any = False
     periods = plan.get("periods", [])
     trigger_times = plan.get("triggerTimes", {})
     
@@ -71,17 +73,26 @@ def register_plan_job(plan):
                     replace_existing=True
                 )
                 print(f"[Scheduler] Registered daily job {job_id} at {t_str}")
+                registered_any = True
             elif period == "week":
                 t_str = trigger_times.get("week", "06:30")
                 h, m = map(int, t_str.split(":"))
+                # Honor the actual selected days (schedWeekDays), matching the
+                # client scheduler's default of weekdays Mon-Fri when unset.
+                # Previously this was hardcoded to Monday only.
+                day_map = {"sun": "sun", "mon": "mon", "tue": "tue", "wed": "wed",
+                           "thu": "thu", "fri": "fri", "sat": "sat"}
+                raw_days = plan.get("schedWeekDays") or ["Mon", "Tue", "Wed", "Thu", "Fri"]
+                cron_days = ",".join(day_map[d[:3].lower()] for d in raw_days if d[:3].lower() in day_map) or "mon"
                 scheduler.add_job(
                     job_wrapper,
-                    trigger=CronTrigger(day_of_week="mon", hour=h, minute=m),
+                    trigger=CronTrigger(day_of_week=cron_days, hour=h, minute=m),
                     id=job_id,
                     args=[plan["id"]],
                     replace_existing=True
                 )
-                print(f"[Scheduler] Registered weekly job {job_id} on Mon at {t_str}")
+                print(f"[Scheduler] Registered weekly job {job_id} on [{cron_days}] at {t_str}")
+                registered_any = True
             elif period == "month":
                 t_str = trigger_times.get("month", "06:30")
                 h, m = map(int, t_str.split(":"))
@@ -93,6 +104,7 @@ def register_plan_job(plan):
                     replace_existing=True
                 )
                 print(f"[Scheduler] Registered monthly job {job_id} on day 1 at {t_str}")
+                registered_any = True
             elif "m" in period or "minute" in period:
                 digits = re.findall(r"\d+", period)
                 if digits:
@@ -105,6 +117,7 @@ def register_plan_job(plan):
                         replace_existing=True
                     )
                     print(f"[Scheduler] Registered interval job {job_id} every {mins} mins")
+                    registered_any = True
             elif "h" in period or "hour" in period:
                 digits = re.findall(r"\d+", period)
                 if digits:
@@ -117,8 +130,20 @@ def register_plan_job(plan):
                         replace_existing=True
                     )
                     print(f"[Scheduler] Registered interval job {job_id} every {hrs} hours")
+                    registered_any = True
         except Exception as e:
             print(f"❌ [Scheduler] Error registering job {job_id}: {e}")
+            try:
+                from backend.db import save_log
+                save_log(f"❌ Failed to schedule '{period}' crawl for plan: {e}", plan.get("name", ""), "error", user_id=plan.get("user_id"))
+            except Exception:
+                pass
+
+    if registered_any:
+        try:
+            save_log(f"✅ Scheduled crawl job(s) registered — will run automatically on the server.", plan.get("name", ""), "info", user_id=plan.get("user_id"))
+        except Exception:
+            pass
 
     # ── Scheduled auto-mail (independent of the crawl schedule above) ──────
     if plan.get("autoMail") and plan.get("sendMode") == "scheduled" and plan.get("sendTime"):
@@ -135,6 +160,11 @@ def register_plan_job(plan):
             print(f"[Scheduler] Registered daily email-send job {email_job_id} at {plan['sendTime']}")
         except Exception as e:
             print(f"❌ [Scheduler] Error registering email job for plan {plan['id']}: {e}")
+            try:
+                from backend.db import save_log
+                save_log(f"❌ Failed to schedule auto-mail send: {e}", plan.get("name", ""), "error", user_id=plan.get("user_id"))
+            except Exception:
+                pass
 
 def remove_plan_job(plan_id):
     # Retrieve all jobs and look for plan_id prefixes
