@@ -2840,10 +2840,10 @@ function reducer(state,action){
     case "LOAD_ALL":
       return {
         ...state,
-        plans: action.plans || [],
-        articles: action.articles || [],
-        emailLog: action.emailLog || [],
-        activityLog: action.activityLog || [],
+        plans: Array.isArray(action.plans) ? action.plans : state.plans,
+        articles: Array.isArray(action.articles) ? action.articles : state.articles,
+        emailLog: Array.isArray(action.emailLog) ? action.emailLog : state.emailLog,
+        activityLog: Array.isArray(action.activityLog) ? action.activityLog : state.activityLog,
         config: action.config || state.config,
         metrics: action.metrics || state.metrics,
         notifications: action.notifications || []
