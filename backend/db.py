@@ -65,6 +65,7 @@ PLAN_DB_TO_PY = {
     "sched_week_days": "schedWeekDays", "sched_month_day": "schedMonthDay",
     "interval_minutes": "intervalMinutes", "sched_custom_unit": "schedCustomUnit",
     "sched_tz": "schedTz", "auto_mail": "autoMail", "send_mode": "sendMode", "send_time": "sendTime",
+    "user_id": "user_id",
 }
 PLAN_PY_TO_DB = {v: k for k, v in PLAN_DB_TO_PY.items()}
 
@@ -76,7 +77,7 @@ ARTICLE_DB_TO_PY = {
     "category": "category", "tags": "tags", "summary": "summary", "content": "content",
     "images": "images", "videos": "videos", "attachments": "attachments", "language": "language",
     "keywords": "keywords", "canonical_url": "canonicalUrl", "meta_description": "metaDescription",
-    "metadata": "metadata", "created_at": "createdAt",
+    "metadata": "metadata", "created_at": "createdAt", "user_id": "user_id",
 }
 ARTICLE_PY_TO_DB = {v: k for k, v in ARTICLE_DB_TO_PY.items()}
 
@@ -118,6 +119,7 @@ def _plan_py_to_row(plan):
     row["fetch_period_days"] = plan.get("fetchPeriodDays", 7)
     row["prompt_enabled"] = bool(plan.get("promptEnabled", True))
     row["auto_mail"] = bool(plan.get("autoMail"))
+    row["user_id"] = plan.get("user_id")
     return row
 
 
@@ -155,6 +157,7 @@ def _article_py_to_row(art):
     row["attachments"] = art.get("attachments", [])
     row["keywords"] = art.get("keywords", [])
     row["metadata"] = art.get("metadata", {})
+    row["user_id"] = art.get("user_id")
     return row
 
 
@@ -219,8 +222,11 @@ def save_settings(cfg):
 # plans
 # -----------------------------------------------------------------------
 
-def get_plans():
-    res = supabase.table("plans").select("*").execute()
+def get_plans(user_id=None):
+    q = supabase.table("plans").select("*")
+    if user_id:
+        q = q.eq("user_id", user_id)
+    res = q.execute()
     return [_plan_row_to_py(r) for r in (res.data or [])]
 
 
@@ -247,16 +253,31 @@ def delete_plan(plan_id):
 # articles
 # -----------------------------------------------------------------------
 
-def get_articles(plan_id=None):
+def get_articles(plan_id=None, user_id=None):
     q = supabase.table("articles").select("*")
     if plan_id:
         q = q.eq("plan_id", plan_id)
+    if user_id:
+        q = q.eq("user_id", user_id)
     res = q.order("pub_date", desc=True).execute()
     return [_article_row_to_py(r) for r in (res.data or [])]
 
 
 def save_article(art):
     plan_id = art.get("planId") or art.get("plan_id")
+
+    # Stamp ownership from the owning plan if not explicitly provided, so
+    # every code path that creates articles (manual save, background crawl,
+    # scheduled crawl) ends up correctly scoped to that plan's owner without
+    # every caller needing to know about user_id.
+    if not art.get("user_id") and plan_id:
+        try:
+            owning_plan = get_plan(plan_id)
+            if owning_plan:
+                art = {**art, "user_id": owning_plan.get("user_id")}
+        except Exception:
+            pass
+
     row = _article_py_to_row(art)
     supabase.table("articles").upsert(row, on_conflict="id").execute()
 
@@ -300,8 +321,11 @@ def delete_articles(plan_id=None, article_id=None):
 # email log
 # -----------------------------------------------------------------------
 
-def get_email_logs():
-    res = supabase.table("email_log").select("*").order("ts", desc=True).execute()
+def get_email_logs(user_id=None):
+    q = supabase.table("email_log").select("*")
+    if user_id:
+        q = q.eq("user_id", user_id)
+    res = q.order("ts", desc=True).execute()
     logs = []
     for r in (res.data or []):
         el = dict(r)
@@ -314,9 +338,17 @@ def get_email_logs():
 
 
 def save_email_log(el):
+    plan_id = el.get("planId") or el.get("plan_id")
+    resolved_user_id = el.get("user_id")
+    if not resolved_user_id and plan_id:
+        try:
+            owning_plan = get_plan(plan_id)
+            resolved_user_id = owning_plan.get("user_id") if owning_plan else None
+        except Exception:
+            resolved_user_id = None
     row = {
         "id": el.get("id"),
-        "plan_id": el.get("planId") or el.get("plan_id"),
+        "plan_id": plan_id,
         "plan_name": el.get("planName") or el.get("plan_name"),
         "ts": el.get("ts"),
         "recipient": el.get("recipient"),
@@ -325,6 +357,7 @@ def save_email_log(el):
         "status": el.get("status"),
         "error": el.get("error"),
         "message_id": el.get("messageId") or el.get("message_id"),
+        "user_id": resolved_user_id,
     }
     supabase.table("email_log").insert(row).execute()
 
@@ -333,8 +366,11 @@ def save_email_log(el):
 # activity log
 # -----------------------------------------------------------------------
 
-def get_logs():
-    res = supabase.table("activity_log").select("*").order("ts", desc=True).limit(1000).execute()
+def get_logs(user_id=None):
+    q = supabase.table("activity_log").select("*")
+    if user_id:
+        q = q.eq("user_id", user_id)
+    res = q.order("ts", desc=True).limit(1000).execute()
     out = []
     for r in (res.data or []):
         d = dict(r)
@@ -344,7 +380,14 @@ def get_logs():
     return out
 
 
-def save_log(event, plan_name="", log_type="info"):
+def save_log(event, plan_name="", log_type="info", plan_id=None, user_id=None):
+    resolved_user_id = user_id
+    if resolved_user_id is None and plan_id:
+        try:
+            owning_plan = get_plan(plan_id)
+            resolved_user_id = owning_plan.get("user_id") if owning_plan else None
+        except Exception:
+            resolved_user_id = None
     log_id = f"log_{int(datetime.utcnow().timestamp() * 1000)}"
     row = {
         "id": log_id,
@@ -352,19 +395,34 @@ def save_log(event, plan_name="", log_type="info"):
         "event": event,
         "plan_name": plan_name,
         "type": log_type,
+        "user_id": resolved_user_id,
     }
     supabase.table("activity_log").insert(row).execute()
 
 
-def clear_activity_logs():
-    supabase.table("activity_log").delete().neq("id", _NEVER_MATCH).execute()
+def clear_activity_logs(user_id=None):
+    q = supabase.table("activity_log").delete()
+    q = q.eq("user_id", user_id) if user_id else q.neq("id", _NEVER_MATCH)
+    q.execute()
 
 
 # -----------------------------------------------------------------------
 # bulk clear
 # -----------------------------------------------------------------------
 
-def clear_all_data():
+def clear_all_data(user_id=None):
+    if user_id:
+        # Only this user's own plans/articles/logs — never touch other users' data.
+        own_plans = supabase.table("plans").select("id").eq("user_id", user_id).execute()
+        plan_ids = [p["id"] for p in (own_plans.data or [])]
+        supabase.table("plans").delete().eq("user_id", user_id).execute()
+        supabase.table("articles").delete().eq("user_id", user_id).execute()
+        supabase.table("email_log").delete().eq("user_id", user_id).execute()
+        supabase.table("activity_log").delete().eq("user_id", user_id).execute()
+        for pid in plan_ids:
+            supabase.table("seen_urls").delete().eq("plan_id", pid).execute()
+        return
+
     supabase.table("plans").delete().neq("id", _NEVER_MATCH).execute()
     supabase.table("articles").delete().neq("id", _NEVER_MATCH).execute()
     supabase.table("email_log").delete().neq("id", _NEVER_MATCH).execute()
@@ -395,3 +453,48 @@ def add_seen_url(plan_id, url):
         "crawled_at": datetime.utcnow().isoformat() + "Z",
     }
     supabase.table("seen_urls").upsert(row, on_conflict="plan_id,url").execute()
+
+
+# -----------------------------------------------------------------------
+# users (real accounts — each person's plans/articles/logs are private)
+# -----------------------------------------------------------------------
+
+def count_users():
+    res = supabase.table("app_users").select("id", count="exact").execute()
+    return res.count or 0
+
+
+def get_user_by_email(email):
+    res = supabase.table("app_users").select("*").eq("email", email.lower().strip()).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def get_user_by_id(user_id):
+    res = supabase.table("app_users").select("*").eq("id", user_id).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def create_user(email, password_hash):
+    user_id = f"user_{int(datetime.utcnow().timestamp() * 1000)}"
+    row = {
+        "id": user_id,
+        "email": email.lower().strip(),
+        "password_hash": password_hash,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    supabase.table("app_users").insert(row).execute()
+    return row
+
+
+def claim_orphan_data(user_id):
+    """One-time convenience: the very first person to sign up after the
+    multi-user migration automatically becomes the owner of any
+    plans/articles/logs that existed before accounts existed (user_id was
+    NULL). Anyone who signs up after that gets a normal, empty, private
+    workspace — this only ever fires once, for the first account."""
+    supabase.table("plans").update({"user_id": user_id}).is_("user_id", "null").execute()
+    supabase.table("articles").update({"user_id": user_id}).is_("user_id", "null").execute()
+    supabase.table("email_log").update({"user_id": user_id}).is_("user_id", "null").execute()
+    supabase.table("activity_log").update({"user_id": user_id}).is_("user_id", "null").execute()
