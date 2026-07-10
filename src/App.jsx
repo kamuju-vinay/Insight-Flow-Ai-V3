@@ -470,31 +470,6 @@ function activeProvider(cfg, keyStatuses = {}) {
   return "None active / Claude (built-in)";
 }
 
-async function sendEmailViaSMTP(smtpSettings, to, subject, html) {
-  const res = await fetch("/api/send-email", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      smtpHost: smtpSettings.smtpHost,
-      smtpPort: smtpSettings.smtpPort,
-      smtpUser: smtpSettings.smtpUser,
-      smtpPassword: smtpSettings.smtpPassword,
-      senderEmail: smtpSettings.senderEmail,
-      senderName: smtpSettings.senderName,
-      to,
-      subject,
-      html,
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `HTTP error! status: ${res.status}`);
-  }
-  return await res.json();
-}
-
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -855,31 +830,6 @@ async function sendEmailForPlan(plan, store, dispatch, showToast, articles, emai
     return { sent: 0, failed: 0 };
   }
 
-  const cfg = store.config || {};
-  const activeSmtp = cfg.active_smtp_provider || "outlook";
-  const smtpHost = activeSmtp === "gmail" ? (cfg.gmail_smtp_host || cfg.smtp_host) : (cfg.outlook_smtp_host || cfg.smtp_host);
-  const smtpPort = activeSmtp === "gmail" ? (cfg.gmail_smtp_port || cfg.smtp_port) : (cfg.outlook_smtp_port || cfg.smtp_port);
-  const smtpUser = activeSmtp === "gmail" ? (cfg.gmail_smtp_user || cfg.smtp_user) : (cfg.outlook_smtp_user || cfg.smtp_user);
-  const smtpPassword = activeSmtp === "gmail" ? (cfg.gmail_smtp_password || cfg.smtp_password) : (cfg.outlook_smtp_password || cfg.smtp_password);
-  const senderEmail = activeSmtp === "gmail" ? (cfg.gmail_sender_email || cfg.sender_email || smtpUser) : (cfg.outlook_sender_email || cfg.sender_email || smtpUser);
-  const senderName = activeSmtp === "gmail" ? (cfg.gmail_sender_name || cfg.sender_name || "Insight Flow AI") : (cfg.outlook_sender_name || cfg.sender_name || "Insight Flow AI");
-
-  if (!smtpHost || !smtpPort || !smtpUser || !smtpPassword) {
-    addLog("❌ SMTP is not configured — add Host, Port, Username & Password in Settings", "error");
-    if (showToast) showToast("Email sending not configured", "error", { sub: "Set up SMTP in Settings first" });
-    dispatch({
-      type: "ADD_NOTIFICATION",
-      entry: {
-        type: "error",
-        title: "Email Delivery Failed",
-        message: `Failed to send email digest for "${plan.name}". SMTP is not configured.`,
-        plan: plan.name
-      }
-    });
-    pushStage("error");
-    return { sent: 0, failed: emails.length };
-  }
-
   pushStage("sending");
   addLog(`📧 Sending digest to ${emails.length} recipient(s)…`);
 
@@ -890,21 +840,20 @@ async function sendEmailForPlan(plan, store, dispatch, showToast, articles, emai
   for (let i = 0; i < emails.length; i++) {
     const email = emails[i];
     try {
-      const smtpSettings = {
-        smtpHost,
-        smtpPort,
-        smtpUser,
-        smtpPassword,
-        senderEmail,
-        senderName,
-      };
-      await sendEmailViaSMTP(smtpSettings, email, subject, articlesHtml);
+      // Sends via the backend's authenticated /api/send-email route (Brevo REST API).
+      await apiSendEmail({
+        planId: plan.id,
+        to: email,
+        subject,
+        html: articlesHtml,
+        articlesCount: articles.length,
+      });
       sentCount++;
     } catch (e) {
       failedCount++;
       addLog(`❌ Failed to send to ${email}: ${e?.message || "Unknown error"}`, "error");
     }
-    // Small stagger between sends to stay under SMTP rate limits
+    // Small stagger between sends to stay under provider rate limits
     if (i < emails.length - 1) await new Promise(r => setTimeout(r, 350));
   }
 
