@@ -116,3 +116,7 @@ on conflict (key) do nothing;
 -- (Supabase default for new tables) since there is no direct client-side
 -- access to this database. If you ever expose these tables to the
 -- Supabase client from the browser, enable RLS and add policies first.
+--
+-- NOTE on multi-user accounts: run supabase_schema_multiuser.sql (in this
+-- same project root) AFTER this file, to add the app_users table and
+-- per-user ownership columns.
