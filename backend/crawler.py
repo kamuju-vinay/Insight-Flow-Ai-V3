@@ -1323,6 +1323,15 @@ def run_crawl_backend(plan_id: str):
     finally:
         with _running_lock:
             _running_plans.discard(plan_id)
+        # Every crawl run (RSS path) populates async_engine's in-memory
+        # _URL_CACHE with full page HTML and never frees it on its own.
+        # Clear it here so memory doesn't grow unbounded across scheduled
+        # runs — this is the fix for the Railway OOM issue.
+        try:
+            from backend.async_engine import clear_url_cache
+            clear_url_cache()
+        except Exception:
+            pass
 
 
 # =============================================================================
