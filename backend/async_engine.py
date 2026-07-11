@@ -23,12 +23,24 @@ from backend.content import (
 log = logging.getLogger(__name__)
 
 _URL_CACHE: dict = {}  # url -> (html, headers) ; avoids duplicate requests within a run
+_URL_CACHE_MAX_SIZE = 2000  # safety cap so a missed clear_url_cache() call can't OOM the process
 
 
 def clear_url_cache():
     """Clear the in-memory URL cache between runs."""
     global _URL_CACHE
     _URL_CACHE = {}
+
+
+def _cache_set(url, value):
+    """Store into _URL_CACHE, evicting the oldest entry if over the size cap.
+    Safety net on top of clear_url_cache() being called after every crawl
+    run (see crawler.py) — without it, a missed clear lets full page HTML
+    accumulate in memory indefinitely and can OOM the Railway container.
+    """
+    if len(_URL_CACHE) >= _URL_CACHE_MAX_SIZE:
+        _URL_CACHE.pop(next(iter(_URL_CACHE)))
+    _URL_CACHE[url] = value
 
 
 async def _fetch_with_retry(session, semaphore, url):
@@ -51,7 +63,7 @@ async def _fetch_with_retry(session, semaphore, url):
                             "text/html" not in content_type
                             and "application/xhtml" not in content_type
                         ):
-                            _URL_CACHE[url] = (None, None)
+                            _cache_set(url, (None, None))
                             return None, None
                         html = await resp.text(errors="ignore")
                         # Guard: some servers mislabel XML/RSS as text/html
@@ -62,25 +74,25 @@ async def _fetch_with_retry(session, semaphore, url):
                             or body_start.startswith("<sitemapindex")
                             or body_start.startswith("<rss")
                         ):
-                            _URL_CACHE[url] = (None, None)
+                            _cache_set(url, (None, None))
                             return None, None
                         headers = dict(resp.headers)
-                        _URL_CACHE[url] = (html, headers)
+                        _cache_set(url, (html, headers))
                         return html, headers
                     elif resp.status in (429, 503):
                         await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
                         continue
                     else:
-                        _URL_CACHE[url] = (None, None)
+                        _cache_set(url, (None, None))
                         return None, None
             except (asyncio.TimeoutError, aiohttp.ClientError):
                 await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
                 continue
             except Exception:
-                _URL_CACHE[url] = (None, None)
+                _cache_set(url, (None, None))
                 return None, None
 
-    _URL_CACHE[url] = (None, None)
+    _cache_set(url, (None, None))
     return None, None
 
 
