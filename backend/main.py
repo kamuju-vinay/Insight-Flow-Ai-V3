@@ -34,7 +34,7 @@ from backend.db import (
 from backend.auth import hash_password, verify_password, create_token, get_current_user_id
 from backend.crawler import run_crawl_backend, fetch_url_html, is_allowed_by_robots
 from backend.scheduler import start_scheduler, stop_scheduler, register_plan_job, remove_plan_job
-from backend.email_service import send_html_email, send_notification, get_brevo_config
+from backend.email_service import send_html_email, send_notification, get_brevo_config, _find_logo
 
 
 @asynccontextmanager
@@ -297,11 +297,19 @@ def send_email_endpoint(payload: dict, user_id: str = Depends(get_current_user_i
         if not plan or plan.get("user_id") != user_id:
             raise HTTPException(status_code=404, detail="Plan not found")
 
+    # The email template (compileEmailHtml, ported from App.jsx) always
+    # references the logo as <img src="cid:logo.png">. The scheduled/auto
+    # send path (send_report) already attaches this; this manual path was
+    # missing it, which left the logo broken on "Send Now" / test sends.
+    logo_path = _find_logo()
+    inline_images = [{"cid": "logo.png", "path": logo_path}] if logo_path else None
+
     result = send_html_email(
         to, subject, html,
         cc=payload.get("cc"),
         bcc=payload.get("bcc"),
         attachments=payload.get("attachments"),
+        inline_images=inline_images,
         articles_count=payload.get("articles_count", 0),
         plan_id=plan_id,
         plan_name="Manual Digest" if not plan_id else "",
