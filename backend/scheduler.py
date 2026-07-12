@@ -1,12 +1,26 @@
 import re
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 # Plan schedule times are set by users based on their local (IST) clock —
 # pin the scheduler to that timezone so a "06:30" entry fires at 06:30 IST
 # no matter what timezone the Render host's OS is running.
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+#
+# MEMORY: APScheduler's default BackgroundScheduler uses a 10-worker thread
+# pool with no per-job overlap limit. That meant every plan's crawl could
+# fire concurrently — each one opening its own async crawl with ~15 HTTP
+# connections and holding page content in memory — which is what was
+# blowing past Railway's 1GB memory cap and causing the OOM kills seen in
+# the deploy activity log. Capping max_workers to 2 and max_instances to 1
+# means at most 2 plan crawls run at the same time, and a single plan can
+# never stack a second run on top of one still in progress.
+scheduler = BackgroundScheduler(
+    timezone="Asia/Kolkata",
+    executors={"default": ThreadPoolExecutor(max_workers=2)},
+    job_defaults={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
+)
 
 
 def email_job_wrapper(plan_id):
