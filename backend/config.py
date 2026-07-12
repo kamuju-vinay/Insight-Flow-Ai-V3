@@ -15,10 +15,10 @@ REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 REQUEST_TIMEOUT_SECONDS = 10
-MAX_CONCURRENT_REQUESTS = 15
+MAX_CONCURRENT_REQUESTS = 8  # lowered from 15 — see scheduler.py note on the OOM fix
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.5
-MAX_PAGES_TO_INSPECT = 400
+MAX_PAGES_TO_INSPECT = 200  # lowered from 400 — same reason
 
 # SITEMAP DISCOVERY
 COMMON_SITEMAP_PATHS = [
