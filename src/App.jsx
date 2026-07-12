@@ -63,7 +63,7 @@ function useLocalStorage(key, initialValue) {
   return [state, setPersistedState];
 }
 
-// ── Store (server-backed — fallback to localStorage for persistence) ─────
+// ── Store (server-backed — Supabase is the source of truth) ─────────────
 function initStore(){
   const defaultStore = {
     config: {
@@ -95,12 +95,13 @@ function initStore(){
     notifications: []
   };
 
-  try {
-    const item = localStorage.getItem("insightflow_store");
-    return item ? JSON.parse(item) : defaultStore;
-  } catch (error) {
-    return defaultStore;
-  }
+  // NOTE: this used to also read a full-state mirror back out of
+  // localStorage("insightflow_store") as a fallback. That mirror has been
+  // removed (see the persist effect below) because it silently exceeded
+  // the browser's ~5-10MB localStorage quota once articles/logs grew, which
+  // looked like a vague "storage problem" with no visible error. The server
+  // (Supabase, via loadData() on mount) is the actual source of truth now.
+  return defaultStore;
 }
 
 // ── AI Providers (Claude / Gemini / Groq / OpenAI / Hugging Face — failover flow) ──
@@ -5658,14 +5659,14 @@ export default function InsightFlowApp(){
     }
   }, [dispatch, showToast]);
 
-  // Persist store to localStorage on changes
-  useEffect(() => {
-    try {
-      localStorage.setItem("insightflow_store", JSON.stringify(store));
-    } catch (e) {
-      console.error("Failed to save store to localStorage", e);
-    }
-  }, [store]);
+  // NOTE: this used to also mirror the entire store into
+  // localStorage("insightflow_store") on every change. That's been removed:
+  // plans/articles/logs/config are already persisted to Supabase (via
+  // loadData() above and the per-action apiSave*/apiAdd* calls elsewhere in
+  // this reducer), so the mirror was redundant — and it was the actual
+  // cause of the recurring "storage" problem, since article content pushed
+  // it past the browser's ~5-10MB localStorage quota and writes started
+  // failing silently (only logged to console, never surfaced to the user).
 
   // Mount effect — check auth session then load data
   useEffect(() => {
