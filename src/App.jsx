@@ -526,7 +526,11 @@ function compileEmailHtml(plan, articles, isPreview = false) {
     year: "numeric"
   });
 
-  const logoSrc = isPreview ? LogoImg : "cid:logo";
+  // Brevo's transactional email API does not support cid: inline image
+  // attachments (confirmed by Brevo support) -- an <img src="cid:logo">
+  // renders as a broken image in every mail client. Use a real https URL
+  // to the logo that's already served as a static asset instead.
+  const logoSrc = isPreview ? LogoImg : `${window.location.origin}/logo.png`;
 
   // 1. Build Articles List (Single column layout)
   let articlesListHtml = "";
